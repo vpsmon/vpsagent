@@ -42,6 +42,7 @@ type Config struct {
 
 type Client struct {
 	metricsURL     string
+	liveURL        string
 	token          string
 	interval       time.Duration
 	httpClient     *http.Client
@@ -50,6 +51,7 @@ type Client struct {
 	threshold      float64
 	snapshotMu     sync.Mutex
 	snapshotActive map[string]bool
+	collectLive    func() ([]metrics.TopProcess, []metrics.TopProcess)
 }
 
 // New validates an enabled Cloud configuration. HTTP is only permitted for an
@@ -62,8 +64,11 @@ func New(config Config) (*Client, error) {
 	if strings.TrimSpace(config.Token) == "" {
 		return nil, fmt.Errorf("VPSAGENT_CLOUD_TOKEN is required when Cloud is enabled")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/metrics"
+	basePath := strings.TrimRight(endpoint.Path, "/")
+	endpoint.Path = basePath + "/v1/live"
 	endpoint.RawQuery = ""
+	liveURL := endpoint.String()
+	endpoint.Path = basePath + "/v1/metrics"
 	if config.Interval <= 0 {
 		config.Interval = DefaultInterval
 	}
@@ -71,9 +76,10 @@ func New(config Config) (*Client, error) {
 		config.SnapshotThreshold = 90
 	}
 	return &Client{
-		metricsURL: endpoint.String(), token: config.Token, interval: config.Interval,
+		metricsURL: endpoint.String(), liveURL: liveURL, token: config.Token, interval: config.Interval,
 		httpClient: &http.Client{Timeout: 10 * time.Second}, logger: log.Default(),
 		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
+		collectLive: metrics.CollectProcessDetails,
 	}, nil
 }
 
@@ -226,8 +232,9 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return min(delay, maxRetryDelay)
 }
 
-// Send uploads resource metrics only. Process and container data remains local
-// unless the owner explicitly enables one-time incident snapshots.
+// Send uploads resource metrics. Process details use a separate, nonpersistent
+// endpoint only when the owner requests a live view. Incident snapshots remain
+// a separate explicit opt-in.
 func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 	sampleID, err := newSampleID()
 	if err != nil {
@@ -243,6 +250,7 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Vpsagent-Live", "1")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -253,6 +261,40 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 		return &responseError{statusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	c.commitSnapshotState(sample)
+	if resp.Header.Get("X-Vpscloud-Live") == "1" {
+		// A failed live view must not mark an accepted resource upload as failed,
+		// replay an incident capture, or stop the normal uploader.
+		_ = c.sendLive(ctx)
+	}
+	return nil
+}
+
+func (c *Client) sendLive(ctx context.Context) error {
+	topCPU, topMem := c.collectLive()
+	payload, err := json.Marshal(struct {
+		Version    int                  `json:"version"`
+		CapturedAt time.Time            `json:"captured_at"`
+		TopCPU     []metrics.TopProcess `json:"top_cpu"`
+		TopMem     []metrics.TopProcess `json:"top_mem"`
+	}{1, time.Now().UTC(), topCPU, topMem})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.liveURL, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
+	if resp.StatusCode != http.StatusNoContent {
+		return &responseError{statusCode: resp.StatusCode}
+	}
 	return nil
 }
 
