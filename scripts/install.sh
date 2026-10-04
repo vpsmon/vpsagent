@@ -69,7 +69,13 @@ EXPECTED_SHA=$(curl --proto '=https' --proto-redir '=https' -fsSL "https://githu
 [[ $EXPECTED_SHA =~ ^[[:xdigit:]]{64}$ ]] || { echo 'No valid release checksum found.' >&2; exit 1; }
 printf '%s  %s\n' "$EXPECTED_SHA" "$TMP_BIN" | sha256sum -c - >/dev/null
 chmod 0700 "$TMP_BIN"
-if ! "$TMP_BIN" connect --help 2>&1 | grep -q -- '--setup-token-stdin'; then
+if ! CONNECT_HELP=$("$TMP_BIN" connect --help 2>&1); then
+  echo 'Could not inspect the downloaded agent. Check that this VPS can run the release binary.' >&2
+  exit 1
+fi
+# Go's flag package prints single-dash flags; accept either help format.
+# Capture help first so grep cannot cause SIGPIPE under pipefail.
+if ! grep -Eq -- '^[[:space:]]+-{1,2}setup-token-stdin([[:space:]]|$)' <<< "$CONNECT_HELP"; then
   echo 'Latest release does not support this installer yet. Wait for the next vpsagent release and retry.' >&2
   exit 1
 fi
