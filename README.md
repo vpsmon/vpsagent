@@ -41,3 +41,54 @@ synced with NTP; Cloud tolerates five minutes of clock skew. A collection confli
 Optional Docker, GPU and process collection shares a three-second deadline and a
 1 MiB output limit. Slow optional commands cannot indefinitely freeze core
 collection. Update existing installations with `sudo /opt/vpsagent/update.sh`.
+
+## Updates from Cloud
+
+Remote updates are **off by default**. For an existing installation, run these
+once on the monitored VPS after the v0.0.8 release is available:
+
+```bash
+sudo /opt/vpsagent/update.sh
+sudo /opt/vpsagent/vpsagent enable-remote-updates
+```
+
+Then open **Server details → Server settings → Update agent** in Cloud. Cloud
+chooses the latest published signed release; updates happen only when you press
+the button. A new install can opt in with `install.sh --enable-remote-updates`.
+Disable requests locally with:
+
+```bash
+sudo /opt/vpsagent/vpsagent disable-remote-updates
+```
+
+A separate outbound HTTPS control check runs every 30 seconds, even if resource
+collection stalls or telemetry is paused by billing. It reports release version,
+Linux architecture, local opt-in state, and update progress. It does not renew
+the metrics heartbeat. No SSH credentials or new inbound ports are needed.
+
+The unprivileged agent writes only a bounded request (ID, version, expiry) into
+`/var/lib/vpsagent-control/requests`. A separate root systemd path/service pair
+accepts only newer releases from `vpsmon/vpsagent`. It verifies the Sigstore
+manifest signature against the GitHub release workflow identity and trusted TUF
+roots, then checks the binary against the signed SHA-256 manifest. The helper
+cannot accept a command, download URL, or installation path from Cloud. Signing
+uses GitHub Actions OIDC; no reusable release signing secret is stored in CI.
+
+The helper atomically replaces `/opt/vpsagent/vpsagent`, restarts its service,
+and checks that the same service process stays running. Failed startup restores
+`vpsagent.previous`. A root-owned journal recovers interrupted installations at
+boot; interrupted downloads leave the current binary in place. Cloud retains up
+to 20 update jobs per server and expires unfinished jobs after 15 minutes. Keep
+the VPS clock synchronized. Updates require outbound HTTPS access to GitHub and
+the Sigstore TUF service. A restart briefly interrupts telemetry.
+
+Diagnostics: `journalctl -u vpsagent-update.service` and
+`systemctl status vpsagent-update.path`. An unprivileged agent cannot turn on the
+root-owned opt-in marker. Disabling requests allows a verified update already in
+progress to finish. Removal stops the updater and removes its managed state.
+
+Tests: `go test -race ./...`. The isolated Linux/systemd integration test is
+explicit: build `go test -c ./internal/update`, then run the test binary as root
+with `VPSAGENT_SYSTEMD_TEST=1 -test.run TestSystemdUpdateAndRollback`. It uses
+unique temporary units, exercises an unprivileged request in a read-only mount
+namespace, tests success and failed-start rollback, and cleans up its own units.

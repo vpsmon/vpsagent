@@ -44,6 +44,7 @@ type Config struct {
 type Client struct {
 	metricsURL     string
 	liveURL        string
+	controlURL     string
 	token          string
 	interval       time.Duration
 	httpClient     *http.Client
@@ -70,6 +71,8 @@ func New(config Config) (*Client, error) {
 	endpoint.Path = basePath + "/v1/live"
 	endpoint.RawQuery = ""
 	liveURL := endpoint.String()
+	endpoint.Path = basePath + "/v1/agent/control"
+	controlURL := endpoint.String()
 	endpoint.Path = basePath + "/v1/metrics"
 	if config.Interval <= 0 {
 		config.Interval = DefaultInterval
@@ -78,7 +81,7 @@ func New(config Config) (*Client, error) {
 		config.SnapshotThreshold = 90
 	}
 	return &Client{
-		metricsURL: endpoint.String(), liveURL: liveURL, token: config.Token, interval: config.Interval,
+		metricsURL: endpoint.String(), liveURL: liveURL, controlURL: controlURL, token: config.Token, interval: config.Interval,
 		httpClient: &http.Client{Timeout: 10 * time.Second}, logger: log.Default(),
 		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
 		collectLive: metrics.CollectProcessDetails,

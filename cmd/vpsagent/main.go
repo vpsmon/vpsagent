@@ -4,12 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/vpsmon/vpsagent/internal/update"
 	"io"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/vpsmon/vpsagent/internal/cloud"
 	"github.com/vpsmon/vpsmonlib/metrics"
@@ -25,6 +27,29 @@ func envBool(key string) bool {
 }
 
 func main() {
+	if len(os.Args) == 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		var err error
+		switch os.Args[1] {
+		case "version":
+			fmt.Println(update.Version)
+			return
+		case "enable-remote-updates":
+			err = update.Enable(ctx)
+		case "disable-remote-updates":
+			err = update.Disable(ctx)
+		case "apply-update":
+			err = update.ApplyPending(ctx)
+		default:
+			goto normal
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+normal:
 	if len(os.Args) > 1 && os.Args[1] == "connect" {
 		connect(os.Args[2:])
 		return
@@ -51,10 +76,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid Cloud configuration: %v", err)
 	}
-	metrics.StartCollectorWithOptions(metrics.Options{TopProcesses: snapshots, Containers: snapshots})
-	log.Printf("vpsagent collecting local metrics and uploading to %s", cloudURL)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	client.StartControl(ctx, update.Version)
+	metrics.StartCollectorWithOptions(metrics.Options{TopProcesses: snapshots, Containers: snapshots})
+	log.Printf("vpsagent collecting local metrics and uploading to %s", cloudURL)
 	client.Start(ctx)
 	<-ctx.Done()
 }

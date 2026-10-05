@@ -11,9 +11,10 @@ SERVICE_GROUP=vpsagent
 CLOUD_URL=
 SETUP_TOKEN=
 ALLOW_INSECURE_LOCAL=false
+ENABLE_REMOTE_UPDATES=false
 
 usage() {
-  echo 'Usage: install.sh [--cloud-url URL] [--setup-token TOKEN] [--allow-insecure-local]' >&2
+  echo 'Usage: install.sh [--cloud-url URL] [--setup-token TOKEN] [--allow-insecure-local] [--enable-remote-updates]' >&2
   exit 2
 }
 
@@ -21,8 +22,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cloud-url) [[ $# -ge 2 ]] || usage; CLOUD_URL=$2; shift 2 ;;
     --setup-token) [[ $# -ge 2 ]] || usage; SETUP_TOKEN=$2; shift 2 ;;
+    --enable-remote-updates) ENABLE_REMOTE_UPDATES=true; shift ;;
     --allow-insecure-local) ALLOW_INSECURE_LOCAL=true; shift ;;
-    -h|--help) echo 'Usage: install.sh [--cloud-url URL] [--setup-token TOKEN] [--allow-insecure-local]'; exit 0 ;;
+    -h|--help) echo 'Usage: install.sh [--cloud-url URL] [--setup-token TOKEN] [--allow-insecure-local] [--enable-remote-updates]'; exit 0 ;;
     *) usage ;;
   esac
 done
@@ -82,7 +84,7 @@ fi
 
 for helper in update remove; do
   helper_tmp="$TEMP_DIR/$helper.sh"
-  curl --proto '=https' --proto-redir '=https' -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/$helper.sh" -o "$helper_tmp"
+  curl --proto '=https' --proto-redir '=https' -fsSL "https://raw.githubusercontent.com/$REPO/$RELEASE_TAG/scripts/$helper.sh" -o "$helper_tmp"
   bash -n "$helper_tmp"
 done
 
@@ -163,6 +165,9 @@ systemctl is-active --quiet "$APP_NAME" || {
   echo "Agent did not start; inspect journalctl -u $APP_NAME -n 50" >&2
   exit 1
 }
+if [[ $ENABLE_REMOTE_UPDATES == true ]]; then
+  "$REMOTE_DIR/$APP_NAME" enable-remote-updates
+fi
 echo 'vpsagent installed and connected to VPSmon Cloud.'
 echo "Status: systemctl status $APP_NAME"
 echo "Update: sudo $REMOTE_DIR/update.sh"

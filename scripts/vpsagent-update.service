@@ -1,0 +1,20 @@
+[Unit]
+Description=Install a signed VPSmon agent release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/vpsagent/vpsagent apply-update
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/vpsagent /var/lib/vpsagent-control /var/cache/vpsagent-update
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

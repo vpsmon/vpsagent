@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for opted-in VPSmon agent updates
+
+[Path]
+PathChanged=/var/lib/vpsagent-control/requests
+PathExists=/var/lib/vpsagent-control/requests/update.json
+Unit=vpsagent-update.service
+
+[Install]
+WantedBy=multi-user.target

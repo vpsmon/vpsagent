@@ -33,6 +33,10 @@ if [[ $ASSUME_YES != true ]]; then
   read -r -p 'Remove vpsagent? [y/N]: ' choice </dev/tty || exit 1
   [[ $choice == [Yy] ]] || { echo 'Aborted.'; exit 0; }
 fi
+systemctl disable --now vpsagent-update.path vpsagent-update.service 2>/dev/null || true
+rm -f /etc/systemd/system/vpsagent.service.d/remote-updates.conf
+rm -f /etc/systemd/system/vpsagent-update.path /etc/systemd/system/vpsagent-update.service
+rm -rf -- /var/lib/vpsagent-control /var/cache/vpsagent-update
 systemctl stop "$APP_NAME" 2>/dev/null || true
 systemctl disable "$APP_NAME" 2>/dev/null || true
 rm -f "/etc/systemd/system/$APP_NAME.service"

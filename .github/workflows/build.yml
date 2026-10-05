@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release
@@ -45,17 +46,24 @@ jobs:
           for target in linux/amd64 linux/arm64; do
             os=${target%/*}
             arch=${target#*/}
-            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/vpsagent-${os}-${arch}" ./cmd/vpsagent
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w -X github.com/vpsmon/vpsagent/internal/update.Version=$RELEASE_TAG" -o "dist/vpsagent-${os}-${arch}" ./cmd/vpsagent
           done
       - name: Checksums
         working-directory: dist
         run: sha256sum vpsagent-* > checksums.txt
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign release manifest
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os
+          from pathlib import Path
+          assets = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path("dist").glob("vpsagent-*")}
+          Path("dist/release.json").write_text(json.dumps({"version": os.environ["RELEASE_TAG"], "assets": assets}, sort_keys=True))
+          PYTHON
+          cosign sign-blob --yes --bundle dist/release.json.sigstore.json dist/release.json
+          cosign verify-blob --bundle dist/release.json.sigstore.json --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build.yml@${GITHUB_REF}" --certificate-oidc-issuer https://token.actions.githubusercontent.com dist/release.json
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            gh release create "$RELEASE_TAG" dist/* --target "$GITHUB_SHA" --generate-notes --title "vpsagent $RELEASE_TAG"
-          fi
+          gh release create "$RELEASE_TAG" dist/* --target "$GITHUB_SHA" --generate-notes --title "vpsagent $RELEASE_TAG"
