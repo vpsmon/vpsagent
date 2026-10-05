@@ -20,6 +20,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
+	"github.com/theupdateframework/go-tuf/v2/metadata/fetcher"
 )
 
 const releaseBase = "https://github.com/vpsmon/vpsagent/releases/download/"
@@ -35,10 +36,23 @@ func VerifyManifest(artifact, proof []byte, version string) error {
 	return verifyManifestContext(ctx, artifact, proof, version)
 }
 
-type contextFetcher struct{ ctx context.Context }
+type contextHTTPClient struct {
+	ctx    context.Context
+	client *http.Client
+}
 
-func (f contextFetcher) DownloadFile(url string, limit int64, _ time.Duration) ([]byte, error) {
-	return download(f.ctx, url, limit)
+func (c contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	return c.client.Do(req.WithContext(c.ctx))
+}
+func tufFetcher(ctx context.Context) *fetcher.DefaultFetcher {
+	f := fetcher.NewDefaultFetcher()
+	f.SetHTTPClient(contextHTTPClient{ctx: ctx, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" || len(via) > 5 {
+			return errors.New("unsafe TUF redirect")
+		}
+		return nil
+	}}})
+	return f
 }
 func verifyManifestContext(ctx context.Context, artifact, proof []byte, version string) error {
 	if !ValidVersion(version) {
@@ -49,7 +63,7 @@ func verifyManifestContext(ctx context.Context, artifact, proof []byte, version 
 		return err
 	}
 	opts := tuf.DefaultOptions()
-	opts.Fetcher = contextFetcher{ctx}
+	opts.Fetcher = tufFetcher(ctx)
 	opts.CachePath = "/var/cache/vpsagent-update/sigstore"
 	trusted, err := root.FetchTrustedRootWithOptions(opts)
 	if err != nil {

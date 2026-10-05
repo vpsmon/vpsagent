@@ -45,7 +45,7 @@ collection. Update existing installations with `sudo /opt/vpsagent/update.sh`.
 ## Updates from Cloud
 
 Remote updates are **off by default**. For an existing installation, run these
-once on the monitored VPS after the v0.0.8 release is available:
+once on the monitored VPS after the v0.0.9 release is available:
 
 ```bash
 sudo /opt/vpsagent/update.sh
