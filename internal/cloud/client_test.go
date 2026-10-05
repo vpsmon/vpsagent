@@ -232,8 +232,8 @@ func TestIncidentSnapshotIsOptInAndOnlySentOnThresholdCrossing(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.httpClient = server.Client()
-	high := metrics.Metrics{CPUUsage: 96, MemPercent: 40, TopCPU: []metrics.TopProcess{{Name: "busy", CPU: 96}}, Containers: []metrics.DockerContainer{{Name: "app"}}}
-	low := metrics.Metrics{CPUUsage: 12, MemPercent: 40}
+	high := metrics.Metrics{Timestamp: time.Now(), CPUUsage: 96, MemPercent: 40, TopCPU: []metrics.TopProcess{{Name: "busy", CPU: 96}}, Containers: []metrics.DockerContainer{{Name: "app"}}}
+	low := metrics.Metrics{Timestamp: time.Now(), CPUUsage: 12, MemPercent: 40}
 	for _, sample := range []metrics.Metrics{high, high, low, high} {
 		if err := client.Send(context.Background(), sample); err != nil {
 			t.Fatal(err)

@@ -28,3 +28,16 @@ sent in this live view.
 Saved incident process/container snapshots remain a separate option, disabled
 unless `VPSAGENT_INCIDENT_SNAPSHOTS=true`. Normal Cloud resource uploads continue
 if a live-process request fails.
+
+## Collection freshness
+
+Cloud uploads require a measurement collected within the last minute. The agent
+uploads each advancing collection timestamp once, skips frozen samples, and
+resumes when fresh collection returns. Cloud also persists timestamp progress so
+new upload IDs cannot make an old measurement look current. Keep the VPS clock
+synced with NTP; Cloud tolerates five minutes of clock skew. A collection conflict
+(HTTP 409) is retried without permanently stopping the uploader.
+
+Optional Docker, GPU and process collection shares a three-second deadline and a
+1 MiB output limit. Slow optional commands cannot indefinitely freeze core
+collection. Update existing installations with `sudo /opt/vpsagent/update.sh`.

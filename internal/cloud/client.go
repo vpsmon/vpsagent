@@ -28,6 +28,7 @@ const DefaultInterval = 15 * time.Second
 const (
 	maxRetryDelay     = 5 * time.Minute
 	accessPausedRetry = 5 * time.Minute
+	maxSampleAge      = time.Minute
 )
 
 // Config contains credentials scoped to one server, never a Cloud user.
@@ -52,6 +53,7 @@ type Client struct {
 	snapshotMu     sync.Mutex
 	snapshotActive map[string]bool
 	collectLive    func() ([]metrics.TopProcess, []metrics.TopProcess)
+	latest         func() (metrics.Metrics, bool)
 }
 
 // New validates an enabled Cloud configuration. HTTP is only permitted for an
@@ -80,6 +82,7 @@ func New(config Config) (*Client, error) {
 		httpClient: &http.Client{Timeout: 10 * time.Second}, logger: log.Default(),
 		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
 		collectLive: metrics.CollectProcessDetails,
+		latest:      metrics.GetLatest,
 	}, nil
 }
 
@@ -108,12 +111,32 @@ func isLoopbackHost(host string) bool {
 // Start uploads a completed local sample every interval. Transient failures use
 // bounded backoff; this optional goroutine never blocks local monitoring.
 func (c *Client) Start(ctx context.Context) {
+	var lastUploaded time.Time
+	var stale bool
 	go c.run(ctx, func(ctx context.Context) (bool, error) {
-		sample, ok := metrics.GetLatest()
+		sample, ok := c.latest()
 		if !ok {
 			return false, nil
 		}
-		return true, c.Send(ctx, sample)
+		if !freshSample(sample, time.Now()) {
+			if !stale {
+				c.logger.Print("vpsagent: collection is stale; waiting for a fresh sample")
+			}
+			stale = true
+			return false, nil
+		}
+		if !sample.Timestamp.After(lastUploaded) {
+			return false, nil
+		}
+		if stale {
+			c.logger.Print("vpsagent: fresh collection resumed")
+			stale = false
+		}
+		err := c.Send(ctx, sample)
+		if err == nil {
+			lastUploaded = sample.Timestamp
+		}
+		return true, err
 	})
 }
 
@@ -168,7 +191,7 @@ func (c *Client) run(ctx context.Context, send func(context.Context) (bool, erro
 					continue
 				case statusErr.statusCode >= 400 && statusErr.statusCode < 500 &&
 					statusErr.statusCode != http.StatusRequestTimeout && statusErr.statusCode != http.StatusTooEarly &&
-					statusErr.statusCode != http.StatusTooManyRequests:
+					statusErr.statusCode != http.StatusTooManyRequests && statusErr.statusCode != http.StatusConflict:
 					c.logger.Printf("vpsagent: telemetry rejected (HTTP %d); uploads paused until restart or reconfiguration", statusErr.statusCode)
 					return
 				}
@@ -236,6 +259,9 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 // endpoint only when the owner requests a live view. Incident snapshots remain
 // a separate explicit opt-in.
 func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
+	if !freshSample(sample, time.Now()) {
+		return errors.New("refusing stale or invalid metric timestamp")
+	}
 	sampleID, err := newSampleID()
 	if err != nil {
 		return fmt.Errorf("create sample id: %w", err)
@@ -267,6 +293,10 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 		_ = c.sendLive(ctx)
 	}
 	return nil
+}
+
+func freshSample(sample metrics.Metrics, now time.Time) bool {
+	return !sample.Timestamp.IsZero() && now.Sub(sample.Timestamp) <= maxSampleAge && sample.Timestamp.Sub(now) <= 5*time.Second
 }
 
 func (c *Client) sendLive(ctx context.Context) error {
