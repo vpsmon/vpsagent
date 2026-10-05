@@ -80,7 +80,7 @@ normal:
 	defer stop()
 	client.StartControl(ctx, update.Version)
 	metrics.StartCollectorWithOptions(metrics.Options{TopProcesses: snapshots, Containers: snapshots})
-	log.Printf("vpsagent collecting local metrics and uploading to %s", cloudURL)
+	log.Printf("vpsagent %s collecting local metrics and uploading to %s", update.Version, cloudURL)
 	client.Start(ctx)
 	<-ctx.Done()
 }
