@@ -25,6 +25,8 @@ jobs:
           go-version-file: go.mod
       - name: Test
         run: go test ./...
+      - name: Test script architecture detection
+        run: bash scripts/test-architecture.sh
       - name: Vet
         run: go vet ./...
       - name: Choose release tag
@@ -41,9 +43,10 @@ jobs:
       - name: Build binaries
         env:
           CGO_ENABLED: "0"
+          GOARM: "6"
         run: |
           mkdir -p dist
-          for target in linux/amd64 linux/arm64; do
+          for target in linux/amd64 linux/arm64 linux/arm linux/386; do
             os=${target%/*}
             arch=${target#*/}
             GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w -X github.com/vpsmon/vpsagent/internal/update.Version=$RELEASE_TAG" -o "dist/vpsagent-${os}-${arch}" ./cmd/vpsagent

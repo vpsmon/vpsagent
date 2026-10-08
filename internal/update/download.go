@@ -109,7 +109,7 @@ func download(ctx context.Context, url string, limit int64) ([]byte, error) {
 	return data, nil
 }
 func FetchRelease(ctx context.Context, version, directory string, verifyManifest func([]byte, []byte, string) error) (string, error) {
-	if !ValidVersion(version) || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
+	if !ValidVersion(version) || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" && runtime.GOARCH != "arm" && runtime.GOARCH != "386") {
 		return "", errors.New("unsupported agent release")
 	}
 	data, err := download(ctx, releaseBase+version+"/release.json", 64<<10)

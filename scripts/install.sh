@@ -46,13 +46,17 @@ else
   echo 'Cloud URL must use HTTPS; loopback HTTP requires --allow-insecure-local.' >&2
   exit 1
 fi
-for dependency in curl sha256sum systemctl getent groupadd useradd install chown mktemp; do
+for dependency in getconf curl sha256sum systemctl getent groupadd useradd install chown mktemp; do
   command -v "$dependency" >/dev/null 2>&1 || { echo "Missing command: $dependency" >&2; exit 1; }
 done
 case $(uname -m) in
-  x86_64) GOARCH=amd64 ;;
-  aarch64|armv8l) GOARCH=arm64 ;;
-  *) echo 'Unsupported Linux architecture.' >&2; exit 1 ;;
+  x86_64)
+    if [[ $(getconf LONG_BIT) == 32 ]]; then GOARCH=386; else GOARCH=amd64; fi ;;
+  i386|i486|i586|i686) GOARCH=386 ;;
+  aarch64)
+    if [[ $(getconf LONG_BIT) == 32 ]]; then GOARCH=arm; else GOARCH=arm64; fi ;;
+  armv6l|armv7l|armv8l) GOARCH=arm ;;
+  *) echo "Unsupported Linux architecture: $(uname -m)." >&2; exit 1 ;;
 esac
 
 RELEASE_JSON=$(curl --proto '=https' --proto-redir '=https' -fsSL "https://api.github.com/repos/$REPO/releases/latest")

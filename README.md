@@ -2,6 +2,14 @@
 
 `vpsagent` is the headless, open-source sender for VPSmon Cloud. It collects host metrics through [vpsmonlib](https://github.com/vpsmon/vpsmonlib) and sends them over outbound HTTPS.
 
+## Supported platforms
+
+Linux with systemd on AMD64, ARM64, 32-bit x86 (386), and 32-bit ARM
+(ARMv6 or newer). The ARM build uses `GOARM=6`, including Raspberry Pi OS
+32-bit on Pi 1, Zero, 2, and 3. Installers select binaries for userspace bitness,
+including a 32-bit OS running under a 64-bit kernel. Remote updates use the same
+architecture as the running agent.
+
 ## Helper scripts
 
 ```bash

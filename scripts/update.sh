@@ -11,13 +11,17 @@ BIN_PATH="$REMOTE_DIR/$APP_NAME"
 [[ $(uname -s) == Linux ]] || { echo 'vpsagent updates require Linux.' >&2; exit 1; }
 [[ -f $BIN_PATH && -f /etc/systemd/system/$APP_NAME.service ]] || { echo 'vpsagent is not installed.' >&2; exit 1; }
 [[ ! -L $REMOTE_DIR && ! -L $BIN_PATH ]] || { echo 'Refusing to update through a symbolic link.' >&2; exit 1; }
-for dependency in curl sha256sum systemctl install; do
+for dependency in getconf curl sha256sum systemctl install; do
   command -v "$dependency" >/dev/null 2>&1 || { echo "Missing command: $dependency" >&2; exit 1; }
 done
 case $(uname -m) in
-  x86_64) GOARCH=amd64 ;;
-  aarch64|armv8l) GOARCH=arm64 ;;
-  *) echo 'Unsupported Linux architecture.' >&2; exit 1 ;;
+  x86_64)
+    if [[ $(getconf LONG_BIT) == 32 ]]; then GOARCH=386; else GOARCH=amd64; fi ;;
+  i386|i486|i586|i686) GOARCH=386 ;;
+  aarch64)
+    if [[ $(getconf LONG_BIT) == 32 ]]; then GOARCH=arm; else GOARCH=arm64; fi ;;
+  armv6l|armv7l|armv8l) GOARCH=arm ;;
+  *) echo "Unsupported Linux architecture: $(uname -m)." >&2; exit 1 ;;
 esac
 
 RELEASE_JSON=$(curl --proto '=https' --proto-redir '=https' -fsSL "https://api.github.com/repos/$REPO/releases/latest")
