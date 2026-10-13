@@ -10,14 +10,20 @@ Linux with systemd on AMD64, ARM64, 32-bit x86 (386), and 32-bit ARM
 including a 32-bit OS running under a 64-bit kernel. Remote updates use the same
 architecture as the running agent.
 
+## Installation prerequisites
+
+New installations use Bash, curl, sha256sum, and standard Linux/systemd
+administration tools. The agent is a standalone binary.
+
+Allow at least 320 MiB free in `/opt` during installation. Downloads have byte
+and time limits. No verifier is downloaded and executed automatically.
+
 ## Helper scripts
 
 ```bash
 sudo /opt/vpsagent/update.sh
 sudo /opt/vpsagent/remove.sh
 ```
-
-`update.sh` checks the latest release, verifies its checksum, and restores the old binary if the service fails to start. `remove.sh` asks for confirmation and removes the local service and credential.
 
 ## Data sent to Cloud
 
@@ -47,16 +53,18 @@ synced with NTP; Cloud tolerates five minutes of clock skew. A collection confli
 (HTTP 409) is retried without permanently stopping the uploader.
 
 Optional Docker, GPU and process collection shares a three-second deadline and a
-1 MiB output limit. Slow optional commands cannot indefinitely freeze core
-collection. Update existing installations with `sudo /opt/vpsagent/update.sh`.
+1 MiB output limit; timed-out Unix commands are terminated as a process group.
+Disk capacity probes use a bounded worker pool and collection deadline. A blocked
+filesystem cannot stop CPU, memory and network samples. Unavailable disk readings
+are omitted rather than relabeled as fresh. ZFS datasets and mount paths with
+escaped characters are supported.
 
 ## Updates from Cloud
 
-Remote updates are **off by default**. For an existing installation, run these
-once on the monitored VPS after the v0.0.9 release is available:
+Remote updates are **off by default**. After migrating an existing installation
+through a trusted release and applying the new service limits, opt in with:
 
 ```bash
-sudo /opt/vpsagent/update.sh
 sudo /opt/vpsagent/vpsagent enable-remote-updates
 ```
 

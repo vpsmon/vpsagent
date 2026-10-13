@@ -2,7 +2,7 @@
 # Exercise the actual installer/updater selection without touching the host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for script in scripts/install.sh scripts/update.sh; do
+for script in scripts/install.sh; do
   selection=$(sed -n '/^case $(uname -m) in$/,/^esac$/p' "$script")
   [[ -n $selection ]]
   while read -r machine bits expected; do

@@ -46,7 +46,7 @@ else
   echo 'Cloud URL must use HTTPS; loopback HTTP requires --allow-insecure-local.' >&2
   exit 1
 fi
-for dependency in getconf curl sha256sum systemctl getent groupadd useradd install chown mktemp; do
+for dependency in getconf curl sha256sum df awk wc grep systemctl getent groupadd useradd install chown mktemp; do
   command -v "$dependency" >/dev/null 2>&1 || { echo "Missing command: $dependency" >&2; exit 1; }
 done
 case $(uname -m) in
@@ -59,37 +59,61 @@ case $(uname -m) in
   *) echo "Unsupported Linux architecture: $(uname -m)." >&2; exit 1 ;;
 esac
 
-RELEASE_JSON=$(curl --proto '=https' --proto-redir '=https' -fsSL "https://api.github.com/repos/$REPO/releases/latest")
-RELEASE_TAG=$(printf '%s\n' "$RELEASE_JSON" | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4 || true)
-ASSET_NAME="$APP_NAME-linux-$GOARCH"
-DOWNLOAD_URL=$(printf '%s\n' "$RELEASE_JSON" | grep '"browser_download_url":' | grep "/${ASSET_NAME}\"" | cut -d '"' -f 4 | head -n 1 || true)
-EXPECTED_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET_NAME"
-[[ -n $RELEASE_TAG && $DOWNLOAD_URL == "$EXPECTED_URL" ]] || { echo 'No matching agent release found.' >&2; exit 1; }
+# Verify before executing any downloaded code. Release CI fills these pins
+# into the published installer. Obtain that installer through a trusted channel.
+RELEASE_TAG='@RELEASE_TAG@'
+case "$GOARCH" in
+  amd64) EXPECTED_SHA='@SHA_AMD64@' ;;
+  arm64) EXPECTED_SHA='@SHA_ARM64@' ;;
+  arm) EXPECTED_SHA='@SHA_ARM@' ;;
+  386) EXPECTED_SHA='@SHA_386@' ;;
+esac
+VERSION_PATTERN='v(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})'
+[[ $RELEASE_TAG =~ ^$VERSION_PATTERN$ && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]] || {
+  echo 'Use the release-generated install.sh from GitHub release assets.' >&2
+  exit 1
+}
 TEMP_DIR=$(mktemp -d /opt/.vpsagent-install.XXXXXX)
 TMP_BIN="$TEMP_DIR/$APP_NAME"
 TMP_UPDATE="$TEMP_DIR/update.sh"
 TMP_REMOVE="$TEMP_DIR/remove.sh"
 trap 'rm -rf -- "$TEMP_DIR"' EXIT
-curl --proto '=https' --proto-redir '=https' -fsSL "$DOWNLOAD_URL" -o "$TMP_BIN"
-EXPECTED_SHA=$(curl --proto '=https' --proto-redir '=https' -fsSL "https://github.com/$REPO/releases/download/$RELEASE_TAG/checksums.txt" | awk -v asset="$ASSET_NAME" '$2 == asset {print $1}')
-[[ $EXPECTED_SHA =~ ^[[:xdigit:]]{64}$ ]] || { echo 'No valid release checksum found.' >&2; exit 1; }
+
+# Allow staging + installed copy at the maximum binary size, leaving 64 MiB
+# available to the host. The signed updater applies its own reserve checks.
+AVAILABLE_KIB=$(LC_ALL=C df -Pk /opt | awk 'NR == 2 {print $4}')
+[[ $AVAILABLE_KIB =~ ^[0-9]+$ && $AVAILABLE_KIB -ge 327680 ]] || {
+  echo 'Not enough free disk space to install safely (320 MiB required).' >&2
+  exit 1
+}
+
+download() (
+  local url=$1 destination=$2 limit=$3
+  # RLIMIT_FSIZE also bounds chunked transfers on older curl versions.
+  ulimit -f "$(((limit + 1023) / 1024))"
+  curl --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+    --max-time 120 --max-filesize "$limit" -fsSL "$url" -o "$destination"
+  [[ $(wc -c < "$destination") -le $limit ]]
+)
+ASSET_NAME="$APP_NAME-linux-$GOARCH"
+RELEASE_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG"
+download "$RELEASE_URL/$ASSET_NAME" "$TMP_BIN" 134217728
 printf '%s  %s\n' "$EXPECTED_SHA" "$TMP_BIN" | sha256sum -c - >/dev/null
 chmod 0700 "$TMP_BIN"
+[[ $("$TMP_BIN" version) == "$RELEASE_TAG" ]] || { echo 'Verified binary version mismatch.' >&2; exit 1; }
 if ! CONNECT_HELP=$("$TMP_BIN" connect --help 2>&1); then
-  echo 'Could not inspect the downloaded agent. Check that this VPS can run the release binary.' >&2
+  echo 'Could not inspect the authenticated agent. Check platform compatibility.' >&2
   exit 1
 fi
-# Go's flag package prints single-dash flags; accept either help format.
-# Capture help first so grep cannot cause SIGPIPE under pipefail.
 if ! grep -Eq -- '^[[:space:]]+-{1,2}setup-token-stdin([[:space:]]|$)' <<< "$CONNECT_HELP"; then
-  echo 'Latest release does not support this installer yet. Wait for the next vpsagent release and retry.' >&2
+  echo 'This release does not support the installer. Use a newer release.' >&2
   exit 1
 fi
-
+# Helpers come from the authenticated executable, not mutable repository files.
 for helper in update remove; do
-  helper_tmp="$TEMP_DIR/$helper.sh"
-  curl --proto '=https' --proto-redir '=https' -fsSL "https://raw.githubusercontent.com/$REPO/$RELEASE_TAG/scripts/$helper.sh" -o "$helper_tmp"
-  bash -n "$helper_tmp"
+  "$TMP_BIN" print-helper "$helper" > "$TEMP_DIR/$helper.sh"
+  [[ -s $TEMP_DIR/$helper.sh ]] || { echo 'Release is missing signed helpers.' >&2; exit 1; }
+  bash -n "$TEMP_DIR/$helper.sh"
 done
 
 if [[ -z $SETUP_TOKEN ]]; then
@@ -156,6 +180,16 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+MemoryHigh=96M
+MemoryMax=128M
+CPUQuota=20%
+TasksMax=64
+Nice=10
+IOWeight=10
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

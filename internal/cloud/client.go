@@ -82,11 +82,23 @@ func New(config Config) (*Client, error) {
 	}
 	return &Client{
 		metricsURL: endpoint.String(), liveURL: liveURL, controlURL: controlURL, token: config.Token, interval: config.Interval,
-		httpClient: &http.Client{Timeout: 10 * time.Second}, logger: log.Default(),
+		httpClient: cloudHTTPClient(10 * time.Second), logger: log.Default(),
 		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
 		collectLive: metrics.CollectProcessDetails,
 		latest:      metrics.GetLatest,
 	}, nil
+}
+
+// cloudHTTPClient never follows redirects. Cloud requests carry scoped bearer
+// credentials and telemetry, so even same-host redirects could downgrade TLS
+// or forward those values to an unintended endpoint.
+func cloudHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func parseCloudURL(raw string, allowInsecure bool) (*url.URL, error) {

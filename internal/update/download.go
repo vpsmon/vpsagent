@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/bundle"
@@ -24,6 +25,7 @@ import (
 )
 
 const releaseBase = "https://github.com/vpsmon/vpsagent/releases/download/"
+const maxBinarySize = int64(128 << 20)
 
 type Manifest struct {
 	Version string            `json:"version"`
@@ -108,6 +110,91 @@ func download(ctx context.Context, url string, limit int64) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// streamDownload writes a bounded response directly to a newly created private
+// file while hashing it. It never retains release binary bytes in memory.
+func streamDownload(ctx context.Context, url, path string, limit int64) (string, int64, error) {
+	return streamDownloadWithClient(ctx, url, path, limit, updateHTTPClient())
+}
+
+func updateHTTPClient() *http.Client {
+	return &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" || len(via) > 5 {
+			return errors.New("unsafe update redirect")
+		}
+		return nil
+	}}
+}
+
+func streamDownloadWithClient(ctx context.Context, url, path string, limit int64, client *http.Client) (string, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	if req.URL.Scheme != "https" {
+		return "", 0, errors.New("unsafe update URL")
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", 0, errors.New("release download failed")
+	}
+	if res.ContentLength > limit {
+		return "", 0, errors.New("release download exceeds limit")
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return "", 0, err
+	}
+	keep := false
+	defer func() {
+		file.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	hash := sha256.New()
+	count, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(res.Body, limit+1))
+	if err != nil {
+		return "", count, err
+	}
+	if count > limit {
+		return "", count, errors.New("release download exceeds limit")
+	}
+	if err := file.Sync(); err != nil {
+		return "", count, err
+	}
+	if err := file.Chmod(0700); err != nil {
+		return "", count, err
+	}
+	if err := file.Sync(); err != nil {
+		return "", count, err
+	}
+	if err := file.Close(); err != nil {
+		return "", count, err
+	}
+	keep = true
+	return hex.EncodeToString(hash.Sum(nil)), count, nil
+}
+
+func streamVerifiedDownload(ctx context.Context, url, path string, limit int64, expected string) error {
+	return streamVerifiedDownloadWithClient(ctx, url, path, limit, expected, updateHTTPClient())
+}
+
+func streamVerifiedDownloadWithClient(ctx context.Context, url, path string, limit int64, expected string, client *http.Client) error {
+	digest, _, err := streamDownloadWithClient(ctx, url, path, limit, client)
+	if err != nil {
+		return err
+	}
+	if digest != expected {
+		_ = os.Remove(path)
+		return errors.New("release checksum mismatch")
+	}
+	return nil
+}
 func FetchRelease(ctx context.Context, version, directory string, verifyManifest func([]byte, []byte, string) error) (string, error) {
 	if !ValidVersion(version) || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" && runtime.GOARCH != "arm" && runtime.GOARCH != "386") {
 		return "", errors.New("unsupported agent release")
@@ -132,18 +219,10 @@ func FetchRelease(ctx context.Context, version, directory string, verifyManifest
 	if len(expected) != 64 || strings.Trim(expected, "0123456789abcdef") != "" {
 		return "", errors.New("invalid release checksum")
 	}
+	path := filepath.Join(directory, "vpsagent")
 	// Fetch into a private staging directory; a corrupt or oversized artifact never
 	// replaces the executable. The manifest signature authenticates this checksum.
-	binary, err := download(ctx, releaseBase+version+"/"+name, 128<<20)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(binary)
-	if hex.EncodeToString(hash[:]) != expected {
-		return "", errors.New("release checksum mismatch")
-	}
-	path := filepath.Join(directory, "vpsagent")
-	if err := os.WriteFile(path, binary, 0700); err != nil {
+	if err := streamVerifiedDownload(ctx, releaseBase+version+"/"+name, path, maxBinarySize, expected); err != nil {
 		return "", err
 	}
 	return path, nil

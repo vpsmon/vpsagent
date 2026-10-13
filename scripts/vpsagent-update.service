@@ -15,6 +15,13 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/opt/vpsagent /var/lib/vpsagent-control /var/cache/vpsagent-update
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryHigh=192M
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=64
+Nice=10
+IOWeight=10
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

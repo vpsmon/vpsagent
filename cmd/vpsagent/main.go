@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	assets "github.com/vpsmon/vpsagent"
 	"github.com/vpsmon/vpsagent/internal/update"
 	"io"
 	"log"
@@ -27,6 +28,21 @@ func envBool(key string) bool {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "print-helper" {
+		switch os.Args[2] {
+		case "update", "remove":
+			data, err := assets.Files.ReadFile("scripts/" + os.Args[2] + ".sh")
+			if err != nil {
+				log.Fatal(err)
+			}
+			if _, err := os.Stdout.Write(data); err != nil {
+				log.Fatal(err)
+			}
+			return
+		default:
+			log.Fatal("unknown helper")
+		}
+	}
 	if len(os.Args) == 2 {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
@@ -39,6 +55,8 @@ func main() {
 			err = update.Enable(ctx)
 		case "disable-remote-updates":
 			err = update.Disable(ctx)
+		case "update":
+			err = update.UpdateLatest(ctx)
 		case "apply-update":
 			err = update.ApplyPending(ctx)
 		default:

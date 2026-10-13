@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+)
+
+const (
+	maxClaimResponseBytes = 16 << 10
+	maxCloudTokenBytes    = 4096
 )
 
 // Credentials are stored separately from the environment so the durable token
@@ -28,7 +34,7 @@ func Connect(ctx context.Context, cloudURL, setupToken, destination string, allo
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(setupToken) == "" {
+	if !validCloudToken(setupToken) {
 		return fmt.Errorf("setup token is required")
 	}
 	hostname, err := os.Hostname()
@@ -45,7 +51,7 @@ func Connect(ctx context.Context, cloudURL, setupToken, destination string, allo
 	}
 	req.Header.Set("Authorization", "Bearer "+setupToken)
 	req.Header.Set("Content-Type", "application/json")
-	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	response, err := cloudHTTPClient(15 * time.Second).Do(req)
 	if err != nil {
 		return fmt.Errorf("claim server: %w", err)
 	}
@@ -54,13 +60,37 @@ func Connect(ctx context.Context, cloudURL, setupToken, destination string, allo
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
 		return fmt.Errorf("claim server: %s: %s", response.Status, strings.TrimSpace(string(message)))
 	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxClaimResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("claim server: read response: %w", err)
+	}
+	if len(data) > maxClaimResponseBytes {
+		return errors.New("claim server: oversized response")
+	}
 	var claimed struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&claimed); err != nil || claimed.Token == "" {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&claimed); err != nil || !validCloudToken(claimed.Token) {
 		return fmt.Errorf("claim server: invalid response")
 	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("claim server: invalid response")
+	}
 	return writeCredentials(destination, Credentials{URL: strings.TrimRight(cloudURL, "/"), Token: claimed.Token})
+}
+
+func validCloudToken(token string) bool {
+	if token == "" || len(token) > maxCloudTokenBytes || strings.TrimSpace(token) != token {
+		return false
+	}
+	for _, r := range token {
+		if r < 0x21 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func writeCredentials(destination string, credentials Credentials) error {

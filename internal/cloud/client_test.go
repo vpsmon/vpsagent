@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -101,6 +102,43 @@ func TestSendReturnsRateLimitAndRetryAfter(t *testing.T) {
 	}
 	if responseErr.statusCode != http.StatusTooManyRequests || responseErr.retryAfter != 3*time.Second {
 		t.Fatalf("response error = %#v", responseErr)
+	}
+}
+
+func TestSendDoesNotFollowRedirects(t *testing.T) {
+	var forwarded atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded.Store(true)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("authorization forwarded to redirect target")
+		}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != 0 {
+			t.Errorf("request body forwarded to redirect target: %d bytes", len(body))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer agent-token" {
+			t.Error("source did not receive token")
+		}
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	c, err := New(Config{URL: source.URL, Token: "agent-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.httpClient = cloudHTTPClient(10 * time.Second)
+	c.httpClient.Transport = source.Client().Transport
+	err = c.Send(context.Background(), metrics.Metrics{Timestamp: time.Now()})
+	var responseErr *responseError
+	if !errors.As(err, &responseErr) || responseErr.statusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("Send error = %v, want redirect response", err)
+	}
+	if forwarded.Load() {
+		t.Fatal("request reached redirect target")
 	}
 }
 
@@ -213,6 +251,61 @@ func TestCredentialsAreOwnerOnly(t *testing.T) {
 	}
 	if credentials.Token != "agent-token" {
 		t.Fatalf("unexpected credentials: %#v", credentials)
+	}
+}
+
+func TestConnectRejectsRedirectWithoutForwardingSetupToken(t *testing.T) {
+	var forwarded atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded.Store(true)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("setup token forwarded to redirect target")
+		}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != 0 {
+			t.Errorf("claim body forwarded to redirect target: %d bytes", len(body))
+		}
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer setup-secret" {
+			t.Error("source did not receive setup token")
+		}
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	destination := filepath.Join(t.TempDir(), "credentials.json")
+	err := Connect(context.Background(), source.URL, "setup-secret", destination, true)
+	if err == nil || forwarded.Load() {
+		t.Fatalf("Connect err = %v, forwarded = %v", err, forwarded.Load())
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("credentials written after redirect: %v", err)
+	}
+}
+
+func TestConnectRejectsOversizedAndMalformedClaimBodies(t *testing.T) {
+	cases := map[string]string{
+		"unknown oversized field": `{"token":"server-token","unused":"` + strings.Repeat("x", maxClaimResponseBytes) + `"}`,
+		"trailing JSON":           `{"token":"server-token"} {}`,
+		"invalid token":           `{"token":"bad token"}`,
+		"oversized token":         `{"token":"` + strings.Repeat("x", maxCloudTokenBytes+1) + `"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			destination := filepath.Join(t.TempDir(), "credentials.json")
+			if err := Connect(context.Background(), server.URL, "setup-secret", destination, true); err == nil {
+				t.Fatal("Connect accepted invalid claim response")
+			}
+			if _, err := os.Stat(destination); !os.IsNotExist(err) {
+				t.Fatalf("credentials written for invalid response: %v", err)
+			}
+		})
 	}
 }
 

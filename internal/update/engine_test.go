@@ -138,6 +138,169 @@ func TestRecoveryAfterReplacementRestoresKnownBackup(t *testing.T) {
 		t.Fatal(v)
 	}
 }
+
+func TestRecoveryHandlesBackupIntentBeforeLink(t *testing.T) {
+	e := testEngine(t)
+	WriteJSON(filepath.Join(e.ControlDir, "journal.json"), journal{Request: request(), OldVersion: "v0.0.8", Running: true, BackupReady: true}, 0600)
+	if err := e.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	version, err := e.CurrentVersion(t.Context())
+	if err != nil || version != "v0.0.8" || readResult(t, e).Status != "failed" {
+		t.Fatal(version, err)
+	}
+}
+
+func TestLowDiskFailsBeforeFetch(t *testing.T) {
+	e := testEngine(t)
+	e.FreeBytes = func(string) (uint64, error) { return 1, nil }
+	e.Fetch = func(context.Context, string, string) (string, error) {
+		t.Fatal("downloaded with insufficient free space")
+		return "", nil
+	}
+	if err := e.Apply(t.Context(), request()); err == nil {
+		t.Fatal("accepted low disk space")
+	}
+	version, _ := e.CurrentVersion(t.Context())
+	if version != "v0.0.8" {
+		t.Fatal("changed installed binary", version)
+	}
+}
+
+func TestCleanupAbandonedRootOwnedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	stage := filepath.Join(dir, ".update-stale")
+	if err := os.Mkdir(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "partial"), []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, ".binary-stale")
+	if err := os.WriteFile(binary, []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanAbandoned(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{stage, binary} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("artifact remains: %s (%v)", path, err)
+		}
+	}
+}
+
+func TestRecoveryCleansAbandonedStagingWithoutJournal(t *testing.T) {
+	e := testEngine(t)
+	stage := filepath.Join(e.InstallDir, ".update-abandoned")
+	if err := os.Mkdir(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "partial"), []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned stage remains: %v", err)
+	}
+}
+
+func TestDownloadSpaceIsRecheckedBeforeReplacement(t *testing.T) {
+	e := testEngine(t)
+	checks := 0
+	e.FreeBytes = func(string) (uint64, error) {
+		checks++
+		if checks == 1 {
+			return uint64(maxBinarySize) + uint64(64<<20), nil
+		}
+		return 1, nil
+	}
+	e.Restart = func(context.Context) error { t.Fatal("restarted with no reserve"); return nil }
+	if err := e.Apply(t.Context(), request()); err == nil {
+		t.Fatal("accepted lost disk reserve")
+	}
+	version, _ := e.CurrentVersion(t.Context())
+	if version != "v0.0.8" || checks != 2 {
+		t.Fatal(version, checks)
+	}
+}
+
+func TestApplySharesManualUpdateLock(t *testing.T) {
+	e := testEngine(t)
+	unlock, err := acquireUpdateLock(t.Context(), e.ControlDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := e.Apply(ctx, request()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply did not wait on shared lock: %v", err)
+	}
+	unlock()
+}
+
+func TestSystemdActivationCanAcquireSharedLock(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := acquireUpdateLock(t.Context(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activated := false
+	err = runAfterUnlock(unlock, func() error {
+		activationUnlock, err := acquireUpdateLock(t.Context(), dir)
+		if err != nil {
+			return err
+		}
+		activationUnlock()
+		activated = true
+		return nil
+	})
+	unlock() // Enable's deferred cleanup must be harmless after early release.
+	if err != nil || !activated {
+		t.Fatalf("activation could not acquire updater lock: %v", err)
+	}
+}
+
+func TestLockRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "lock")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireUpdateLock(t.Context(), dir); err == nil {
+		t.Fatal("accepted symlink lock")
+	}
+}
+
+func TestControlDirectoryBecomesTraversableAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	owner := uint32(os.Geteuid())
+	if err := makeDirectoryTraversable(dir, owner); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0755 {
+		t.Fatalf("mode = %v, err = %v", info.Mode().Perm(), err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := makeDirectoryTraversable(dir, owner); err == nil {
+		t.Fatal("made an unsafe writable directory traversable")
+	}
+	info, err = os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0777 {
+		t.Fatalf("unsafe directory mode was changed: %v, %v", info.Mode().Perm(), err)
+	}
+}
 func TestInvalidRequestsNeverFetch(t *testing.T) {
 	for _, r := range []Request{{ID: "upd_test", TargetVersion: "../../bin/sh", ExpiresAt: time.Now().Add(time.Minute)}, {ID: "upd_test", TargetVersion: "v0.0.7", ExpiresAt: time.Now().Add(time.Minute)}, {ID: "upd_test", TargetVersion: "v0.0.9", ExpiresAt: time.Now().Add(-time.Minute)}, {ID: "not-an-id", TargetVersion: "v0.0.9", ExpiresAt: time.Now().Add(time.Minute)}} {
 		e := testEngine(t)
