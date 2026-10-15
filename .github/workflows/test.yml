@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test ./...
+      - name: Race tests
+        run: go test -race ./...
+      - name: Isolated systemd updater and recovery test
+        run: |
+          go test -c -o /tmp/vpsagent-update.test ./internal/update
+          sudo env VPSAGENT_SYSTEMD_TEST=1 /tmp/vpsagent-update.test -test.run '^TestSystemdUpdateAndRollback$'
+      - name: Vet
+        run: go vet ./...
+      - name: Check scripts and installer flow
+        run: |
+          bash scripts/test-architecture.sh
+          bash -n scripts/install.sh scripts/remove.sh
+          python3 scripts/test-install-verification.py

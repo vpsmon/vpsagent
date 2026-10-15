@@ -25,6 +25,10 @@ jobs:
           go-version-file: go.mod
       - name: Test
         run: go test ./...
+      - name: Test isolated systemd update and readiness rollback
+        run: |
+          go test -c -o /tmp/vpsagent-update.test ./internal/update
+          sudo env VPSAGENT_SYSTEMD_TEST=1 /tmp/vpsagent-update.test -test.run '^TestSystemdUpdateAndRollback$'
       - name: Race test
         run: go test -race ./...
       - name: Test script architecture detection

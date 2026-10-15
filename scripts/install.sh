@@ -128,6 +128,8 @@ CREATED_USER=false
 printf 'created_user=%s\ncreated_group=%s\n' "$CREATED_USER" "$CREATED_GROUP" > "$REMOTE_DIR/.managed"
 chmod 0600 "$REMOTE_DIR/.managed"
 install -m 0755 -o root -g root "$TMP_BIN" "$REMOTE_DIR/$APP_NAME"
+ln "$REMOTE_DIR/$APP_NAME" "$REMOTE_DIR/vpsagent-recovery"
+install -d -m 0755 -o root -g root /var/lib/vpsagent-control
 install -m 0755 -o root -g root "$TMP_UPDATE" "$REMOTE_DIR/update.sh"
 install -m 0755 -o root -g root "$TMP_REMOVE" "$REMOTE_DIR/remove.sh"
 
@@ -169,12 +171,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$REMOTE_DIR
 EnvironmentFile=$REMOTE_DIR/.env
 ExecStart=$REMOTE_DIR/$APP_NAME
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -195,7 +199,39 @@ OOMScoreAdjust=500
 WantedBy=multi-user.target
 SERVICE
 chmod 0644 "/etc/systemd/system/$APP_NAME.service"
+cat > /etc/systemd/system/vpsagent-recover.service <<'RECOVERY_SERVICE'
+[Unit]
+Description=Recover an interrupted VPSmon agent update
+DefaultDependencies=no
+After=local-fs.target
+Before=vpsagent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/vpsagent/vpsagent-recovery recover-update --boot
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/vpsagent /var/lib/vpsagent-control /etc/systemd/system/vpsagent.service.d
+
+[Install]
+WantedBy=multi-user.target
+RECOVERY_SERVICE
+chmod 0644 /etc/systemd/system/vpsagent-recover.service
+install -d -m 0755 /etc/systemd/system/vpsagent.service.d
+cat > /etc/systemd/system/vpsagent.service.d/recovery.conf <<'RECOVERY_DROPIN'
+[Unit]
+Requires=vpsagent-recover.service
+After=vpsagent-recover.service
+RECOVERY_DROPIN
+chmod 0644 /etc/systemd/system/vpsagent.service.d/recovery.conf
 systemctl daemon-reload
+systemctl enable --now vpsagent-recover.service --quiet
 systemctl enable "$APP_NAME" --quiet
 systemctl restart "$APP_NAME"
 sleep 2

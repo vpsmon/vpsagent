@@ -15,14 +15,18 @@ import (
 )
 
 type Engine struct {
-	InstallDir     string
-	ControlDir     string
-	Fetch          func(context.Context, string, string) (string, error)
-	Restart        func(context.Context) error
-	Healthy        func(context.Context, string) error
-	CurrentVersion func(context.Context) (string, error)
-	FreeBytes      func(string) (uint64, error)
-	RefreshHelpers func(context.Context) error
+	InstallDir      string
+	ControlDir      string
+	Fetch           func(context.Context, string, string) (string, error)
+	Restart         func(context.Context) error
+	Healthy         func(context.Context, string) error
+	CurrentVersion  func(context.Context) (string, error)
+	FreeBytes       func(string) (uint64, error)
+	RefreshHelpers  func(context.Context) error
+	RefreshRecovery func(context.Context) error
+	PrepareRestart  func(context.Context, string) error
+	NotifyCapable   func(context.Context, string) (bool, error)
+	RequireNotify   bool
 }
 type journal struct {
 	Request     Request `json:"request"`
@@ -45,9 +49,47 @@ func Production() Engine {
 		return executableVersion(ctx, filepath.Join(InstallDir, "vpsagent"))
 	}
 	e.Healthy = func(ctx context.Context, target string) error {
-		return serviceHealthy(ctx, "vpsagent.service", target, e.CurrentVersion)
+		binary := filepath.Join(InstallDir, "vpsagent")
+		capable, err := supportsSystemdNotify(ctx, binary)
+		if err != nil {
+			return err
+		}
+		return serviceHealthyMode(ctx, "vpsagent.service", target, e.CurrentVersion, capable)
+	}
+	e.NotifyCapable = supportsSystemdNotify
+	e.RequireNotify = true
+	e.PrepareRestart = func(ctx context.Context, _ string) error {
+		capable, err := supportsSystemdNotify(ctx, filepath.Join(InstallDir, "vpsagent"))
+		if err != nil {
+			return err
+		}
+		serviceType := "simple"
+		if capable {
+			serviceType = "notify"
+		}
+		data := []byte("[Unit]\nRequires=vpsagent-recover.service\nAfter=vpsagent-recover.service\n[Service]\nType=" + serviceType + "\nNotifyAccess=main\nTimeoutStartSec=60\n")
+		if err := writeSetupFile("/etc/systemd/system/vpsagent.service.d/recovery.conf", data, 0644); err != nil {
+			return err
+		}
+		return exec.CommandContext(ctx, "systemctl", "daemon-reload").Run()
 	}
 	e.RefreshHelpers = refreshInstalledHelpers
+	e.RefreshRecovery = func(ctx context.Context) error {
+		binary := filepath.Join(InstallDir, "vpsagent")
+		if err := trustedPath(binary, false); err != nil {
+			return err
+		}
+		capable, err := supportsSystemdNotify(ctx, binary)
+		if err != nil {
+			return err
+		}
+		if !capable {
+			// Keep the stable recovery program when rolling back to a release that
+			// predates the boot-recovery command.
+			return nil
+		}
+		return linkRecoveryExecutable(binary, filepath.Join(InstallDir, "vpsagent-recovery"))
+	}
 	return e
 }
 
@@ -147,35 +189,94 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 func serviceHealthy(ctx context.Context, service, target string, version func(context.Context) (string, error)) error {
-	stable := 0
-	var previousPID string
-	for range 15 {
-		pid, pidErr := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", service).Output()
-		currentPID := strings.TrimSpace(string(pid))
-		if pidErr == nil && currentPID != "" && currentPID != "0" && exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", service).Run() == nil {
-			actual, err := version(ctx)
-			if err == nil && actual == target {
-				if currentPID != previousPID {
-					stable = 0
-				}
-				previousPID = currentPID
-				stable++
-				if stable >= 5 {
-					return nil
-				}
-			} else {
-				stable = 0
-			}
-		} else {
-			stable = 0
+	return serviceHealthyMode(ctx, service, target, version, true)
+}
+
+func serviceHealthyMode(ctx context.Context, service, target string, version func(context.Context) (string, error), requireNotify bool) error {
+	return serviceHealthyModeWithInterval(ctx, service, target, version, requireNotify, time.Second)
+}
+
+func serviceHealthyModeWithInterval(ctx context.Context, service, target string, version func(context.Context) (string, error), requireNotify bool, interval time.Duration) error {
+	var stablePID string
+	for check := 0; check < 5; check++ {
+		props, err := exec.CommandContext(ctx, "systemctl", "show", "--property=Type,MainPID,ActiveState", service).Output()
+		if err != nil {
+			return fmt.Errorf("inspect updated service: %w", err)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
+		serviceType, pid, state, err := parseSystemdProperties(string(props))
+		if err != nil || pid == "0" || state != "active" || (requireNotify && serviceType != "notify") || (!requireNotify && serviceType != "simple") {
+			return errors.New("updated agent service did not report readiness")
+		}
+		if check == 0 {
+			actual, err := version(ctx)
+			if err != nil {
+				return err
+			}
+			if actual != target {
+				return fmt.Errorf("updated agent version mismatch: expected %s, got %s", target, actual)
+			}
+			stablePID = pid
+		} else if pid != stablePID {
+			return errors.New("agent main process changed after readiness")
+		}
+		if check < 4 {
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
-	return errors.New("updated agent did not remain running")
+	return nil
+}
+
+func parseSystemdProperties(output string) (serviceType, pid, state string, err error) {
+	// Named output avoids assuming a property order that can vary by systemd
+	// version. The values-only fallback keeps unit tests and older shims simple.
+	for _, line := range strings.Split(output, "\n") {
+		if key, value, ok := strings.Cut(line, "="); ok {
+			switch key {
+			case "Type":
+				serviceType = value
+			case "MainPID":
+				pid = value
+			case "ActiveState":
+				state = value
+			}
+		}
+	}
+	if serviceType == "" && pid == "" && state == "" {
+		fields := strings.Fields(output)
+		if len(fields) == 3 {
+			serviceType, pid, state = fields[0], fields[1], fields[2]
+		}
+	}
+	if serviceType == "" || pid == "" || state == "" {
+		return "", "", "", errors.New("incomplete systemd service properties")
+	}
+	return serviceType, pid, state, nil
+}
+
+func supportsSystemdNotify(ctx context.Context, binary string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, binary, "capabilities").Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		// Previous released binaries predate the capabilities command. They use
+		// Type=simple so rollback can still start them successfully.
+		return false, nil
+	}
+	for _, capability := range strings.Fields(string(output)) {
+		if capability == "systemd-notify-v1" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func executableVersion(ctx context.Context, path string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -210,7 +311,7 @@ func (e Engine) Apply(ctx context.Context, r Request) (applyErr error) {
 		return err
 	}
 	defer unlock()
-	if err := e.recover(ctx); err != nil {
+	if err := e.recover(ctx, true); err != nil {
 		return err
 	}
 	return e.applyLocked(ctx, r)
@@ -280,10 +381,13 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 		if applyErr != nil && j.Running {
 			recoveryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			recoveryErr := e.recover(recoveryCtx)
+			recoveryErr := e.recover(recoveryCtx, true)
 			applyErr = errors.Join(applyErr, recoveryErr)
 			if recoveryErr == nil && e.RefreshHelpers != nil {
 				applyErr = errors.Join(applyErr, e.RefreshHelpers(recoveryCtx))
+			}
+			if recoveryErr == nil && e.RefreshRecovery != nil {
+				applyErr = errors.Join(applyErr, e.RefreshRecovery(recoveryCtx))
 			}
 		}
 	}()
@@ -318,6 +422,16 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 	if err := e.HealthyCandidate(ctx, candidate, r.TargetVersion); err != nil {
 		finish("failed", "verification_failed", current)
 		return err
+	}
+	if e.RequireNotify && e.NotifyCapable != nil {
+		capable, err := e.NotifyCapable(ctx, candidate)
+		if err != nil || !capable {
+			if err == nil {
+				err = errors.New("release does not support service readiness notifications")
+			}
+			finish("failed", "verification_failed", current)
+			return err
+		}
 	}
 	// Retain the previous fallback until the new candidate is authenticated and
 	// locally runnable. The current binary becomes the rollback link next.
@@ -357,6 +471,11 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 	if err := e.result(r, "running", "restarting", current); err != nil {
 		return err
 	}
+	if e.PrepareRestart != nil {
+		if err = e.PrepareRestart(ctx, r.TargetVersion); err != nil {
+			return err
+		}
+	}
 	if err = e.Restart(ctx); err == nil {
 		err = e.Healthy(ctx, r.TargetVersion)
 	}
@@ -368,7 +487,13 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 			return err
 		}
 	}
-	return finish("succeeded", "complete", r.TargetVersion)
+	if err := finish("succeeded", "complete", r.TargetVersion); err != nil {
+		return err
+	}
+	if e.RefreshRecovery != nil {
+		return e.RefreshRecovery(ctx)
+	}
+	return nil
 }
 func (e Engine) HealthyCandidate(ctx context.Context, path, expected string) error {
 	if filepath.Dir(path) == e.InstallDir {
@@ -419,6 +544,42 @@ func copyExecutable(source, target string) error {
 		return err
 	}
 	if err := os.Rename(file.Name(), target); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(target))
+}
+
+// linkRecoveryExecutable retains the prior inode across the atomic executable
+// replacement while using negligible disk space. Successful updates refresh
+// this link only after the journal is marked complete.
+func linkRecoveryExecutable(source, target string) error {
+	if err := trustedPath(source, false); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(target); err == nil {
+		if err := trustedPath(target, false); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(target), ".recovery-link-")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	if err := file.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Remove(name); err != nil {
+		return err
+	}
+	defer os.Remove(name)
+	if err := os.Link(source, name); err != nil {
+		return err
+	}
+	if err := os.Rename(name, target); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(target))
@@ -477,7 +638,7 @@ func cleanAbandoned(dir string) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, ".update-") && !strings.HasPrefix(name, ".binary-") {
+		if !strings.HasPrefix(name, ".update-") && !strings.HasPrefix(name, ".binary-") && !strings.HasPrefix(name, ".recovery-link-") {
 			continue
 		}
 		path := filepath.Join(dir, name)
@@ -504,10 +665,21 @@ func (e Engine) Recover(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	return e.recover(ctx)
+	return e.recover(ctx, true)
 }
 
-func (e Engine) recover(ctx context.Context) error {
+// RecoverAtBoot restores an interrupted replacement before vpsagent.service
+// starts. It deliberately does not restart or probe that not-yet-started unit.
+func (e Engine) RecoverAtBoot(ctx context.Context) error {
+	unlock, err := acquireUpdateLock(ctx, e.ControlDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return e.recover(ctx, false)
+}
+
+func (e Engine) recover(ctx context.Context, restart bool) error {
 	if err := trustedPath(e.InstallDir, true); err != nil {
 		return err
 	}
@@ -554,11 +726,18 @@ func (e Engine) recover(ctx context.Context) error {
 				return errors.New("missing recovery binary")
 			}
 		}
-		if err := e.Restart(ctx); err != nil {
-			return err
+		if e.PrepareRestart != nil {
+			if err := e.PrepareRestart(ctx, j.OldVersion); err != nil {
+				return err
+			}
 		}
-		if err := e.Healthy(ctx, j.OldVersion); err != nil {
-			return err
+		if restart {
+			if err := e.Restart(ctx); err != nil {
+				return err
+			}
+			if err := e.Healthy(ctx, j.OldVersion); err != nil {
+				return err
+			}
 		}
 		if hadBackup {
 			status = "rolled_back"

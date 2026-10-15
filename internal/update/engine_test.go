@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -18,6 +19,13 @@ func fixture(t *testing.T, path, version string) {
 func testEngine(t *testing.T) Engine {
 	t.Helper()
 	e := Engine{InstallDir: t.TempDir(), ControlDir: t.TempDir()}
+	// Some Linux test runners use umask 0002, which leaves TempDir group-writable.
+	// Updater paths are deliberately private, so make the fixtures match that contract.
+	for _, path := range []string{e.InstallDir, e.ControlDir} {
+		if err := os.Chmod(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	fixture(t, filepath.Join(e.InstallDir, "vpsagent"), "v0.0.8")
 	e.CurrentVersion = func(ctx context.Context) (string, error) {
 		return executableVersion(ctx, filepath.Join(e.InstallDir, "vpsagent"))
@@ -139,6 +147,168 @@ func TestRecoveryAfterReplacementRestoresKnownBackup(t *testing.T) {
 	}
 }
 
+func TestBootRecoveryRestoresWithoutStartingService(t *testing.T) {
+	e := testEngine(t)
+	fixture(t, filepath.Join(e.InstallDir, "vpsagent.previous"), "v0.0.8")
+	fixture(t, filepath.Join(e.InstallDir, "vpsagent"), "v0.0.9")
+	WriteJSON(filepath.Join(e.ControlDir, "journal.json"), journal{Request: request(), OldVersion: "v0.0.8", Running: true, BackupReady: true}, 0600)
+	e.Restart = func(context.Context) error { t.Fatal("boot recovery restarted a not-yet-started service"); return nil }
+	e.Healthy = func(context.Context, string) error {
+		t.Fatal("boot recovery probed a not-yet-started service")
+		return nil
+	}
+	if err := e.RecoverAtBoot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	version, err := e.CurrentVersion(t.Context())
+	if err != nil || version != "v0.0.8" || readResult(t, e).Status != "rolled_back" {
+		t.Fatal(version, err, readResult(t, e))
+	}
+}
+
+func TestBootRecoveryWithNoJournalIsNoop(t *testing.T) {
+	e := testEngine(t)
+	if err := e.RecoverAtBoot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	version, err := e.CurrentVersion(t.Context())
+	if err != nil || version != "v0.0.8" {
+		t.Fatal(version, err)
+	}
+}
+
+func TestServiceHealthyRequiresNotifyReadiness(t *testing.T) {
+	bin := t.TempDir()
+	path := filepath.Join(bin, "systemctl")
+	counter := filepath.Join(bin, "count")
+	writeSystemctl := func(props string) {
+		t.Helper()
+		script := "#!/bin/sh\nn=0\nif [ -f \"$VPSAGENT_HEALTH_COUNTER\" ]; then n=$(cat \"$VPSAGENT_HEALTH_COUNTER\"); fi\nn=$((n + 1))\nprintf '%s' \"$n\" > \"$VPSAGENT_HEALTH_COUNTER\"\nprintf '%b\\n' '" + props + "'\n"
+		if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("VPSAGENT_HEALTH_COUNTER", counter)
+	versionCalls := 0
+	version := func(context.Context) (string, error) { versionCalls++; return "v0.0.9", nil }
+	writeSystemctl("notify\\n4242\\nactive")
+	if err := serviceHealthyModeWithInterval(t.Context(), "test.service", "v0.0.9", version, true, time.Millisecond); err != nil || versionCalls != 1 {
+		t.Fatalf("ready service rejected: %v (version calls %d)", err, versionCalls)
+	}
+	if calls, err := os.ReadFile(counter); err != nil || string(calls) != "5" {
+		t.Fatalf("stability checks = %q, err=%v; want five checks", calls, err)
+	}
+	if err := os.Remove(counter); err != nil {
+		t.Fatal(err)
+	}
+	writeSystemctl("simple\\n4242\\nactive")
+	versionCalls = 0
+	if err := serviceHealthyModeWithInterval(t.Context(), "test.service", "v0.0.9", version, true, time.Millisecond); err == nil || versionCalls != 0 {
+		t.Fatalf("non-notify service accepted: %v (version calls %d)", err, versionCalls)
+	}
+}
+
+func TestServiceHealthyRejectsCrashOrPIDChangeAfterReady(t *testing.T) {
+	bin := t.TempDir()
+	path := filepath.Join(bin, "systemctl")
+	counter := filepath.Join(bin, "count")
+	script := `#!/bin/sh
+n=0
+if [ -f "$VPSAGENT_TEST_COUNTER" ]; then n=$(cat "$VPSAGENT_TEST_COUNTER"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$VPSAGENT_TEST_COUNTER"
+if [ "$VPSAGENT_TEST_FAILURE" = inactive ] && [ "$n" -eq 2 ]; then
+  printf 'Type=notify\nMainPID=0\nActiveState=inactive\n'
+elif [ "$VPSAGENT_TEST_FAILURE" = pid ] && [ "$n" -ge 2 ]; then
+  printf 'Type=notify\nMainPID=4243\nActiveState=active\n'
+else
+  printf 'Type=notify\nMainPID=4242\nActiveState=active\n'
+fi
+`
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("VPSAGENT_TEST_COUNTER", counter)
+	for _, failure := range []string{"inactive", "pid"} {
+		t.Run(failure, func(t *testing.T) {
+			if err := os.Remove(counter); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			t.Setenv("VPSAGENT_TEST_FAILURE", failure)
+			versionCalls := 0
+			version := func(context.Context) (string, error) { versionCalls++; return "v0.0.9", nil }
+			err := serviceHealthyModeWithInterval(t.Context(), "test.service", "v0.0.9", version, true, time.Millisecond)
+			if err == nil || versionCalls != 1 {
+				t.Fatalf("accepted unstable service: err=%v versionCalls=%d", err, versionCalls)
+			}
+		})
+	}
+}
+
+func TestServiceHealthyStopsWaitingWhenContextIsCanceled(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\nprintf 'Type=notify\\nMainPID=4242\\nActiveState=active\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(t.Context())
+	version := func(context.Context) (string, error) {
+		cancel()
+		return "v0.0.9", nil
+	}
+	start := time.Now()
+	err := serviceHealthyModeWithInterval(ctx, "test.service", "v0.0.9", version, true, time.Hour)
+	if !errors.Is(err, context.Canceled) || time.Since(start) > time.Second {
+		t.Fatalf("canceled stability wait returned %v after %s", err, time.Since(start))
+	}
+}
+
+func TestParseSystemdPropertiesUsesNamesWithoutAssumingOrder(t *testing.T) {
+	typeData := "ActiveState=active\nMainPID=741\nType=notify\n"
+	serviceType, pid, state, err := parseSystemdProperties(typeData)
+	if err != nil || serviceType != "notify" || pid != "741" || state != "active" {
+		t.Fatalf("parsed %q %q %q, err=%v", serviceType, pid, state, err)
+	}
+}
+
+func TestRecoveryHelperHardLinkSurvivesExecutableReplacement(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "vpsagent")
+	helper := filepath.Join(dir, "vpsagent-recovery")
+	fixture(t, current, "v0.0.8")
+	if err := linkRecoveryExecutable(current, helper); err != nil {
+		t.Fatal(err)
+	}
+	oldInfo, err := os.Stat(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFile := filepath.Join(dir, "new-agent")
+	fixture(t, newFile, "v0.0.9")
+	if err := os.Rename(newFile, current); err != nil {
+		t.Fatal(err)
+	}
+	oldVersion, err := executableVersion(t.Context(), helper)
+	if err != nil || oldVersion != "v0.0.8" {
+		t.Fatalf("stable helper changed to %s: %v", oldVersion, err)
+	}
+	newVersion, err := executableVersion(t.Context(), current)
+	if err != nil || newVersion != "v0.0.9" {
+		t.Fatalf("current binary is %s: %v", newVersion, err)
+	}
+	currentInfo, err := os.Stat(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStat := oldInfo.Sys().(*syscall.Stat_t)
+	newStat := currentInfo.Sys().(*syscall.Stat_t)
+	if oldStat.Ino == newStat.Ino {
+		t.Fatal("atomic binary replacement changed the stable helper inode")
+	}
+}
+
 func TestRecoveryHandlesBackupIntentBeforeLink(t *testing.T) {
 	e := testEngine(t)
 	WriteJSON(filepath.Join(e.ControlDir, "journal.json"), journal{Request: request(), OldVersion: "v0.0.8", Running: true, BackupReady: true}, 0600)
@@ -180,10 +350,14 @@ func TestCleanupAbandonedRootOwnedArtifacts(t *testing.T) {
 	if err := os.WriteFile(binary, []byte("partial"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	recoveryLink := filepath.Join(dir, ".recovery-link-stale")
+	if err := os.WriteFile(recoveryLink, []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := cleanAbandoned(dir); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{stage, binary} {
+	for _, path := range []string{stage, binary, recoveryLink} {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("artifact remains: %s (%v)", path, err)
 		}
@@ -243,6 +417,9 @@ func TestApplySharesManualUpdateLock(t *testing.T) {
 
 func TestSystemdActivationCanAcquireSharedLock(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	unlock, err := acquireUpdateLock(t.Context(), dir)
 	if err != nil {
 		t.Fatal(err)

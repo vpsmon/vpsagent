@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/vpsmon/vpsagent/internal/cloud"
+	"github.com/vpsmon/vpsagent/internal/service"
 	"github.com/vpsmon/vpsmonlib/metrics"
 )
 
@@ -28,6 +29,14 @@ func envBool(key string) bool {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "recover-update" && os.Args[2] == "--boot" {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := update.RecoverAtBoot(ctx); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) == 3 && os.Args[1] == "print-helper" {
 		switch os.Args[2] {
 		case "update", "remove":
@@ -50,6 +59,9 @@ func main() {
 		switch os.Args[1] {
 		case "version":
 			fmt.Println(update.Version)
+			return
+		case "capabilities":
+			fmt.Println("systemd-notify-v1")
 			return
 		case "enable-remote-updates":
 			err = update.Enable(ctx)
@@ -100,6 +112,16 @@ normal:
 	metrics.StartCollectorWithOptions(metrics.Options{TopProcesses: snapshots, Containers: snapshots})
 	log.Printf("vpsagent %s collecting local metrics and uploading to %s", update.Version, cloudURL)
 	client.Start(ctx)
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-client.Ready():
+			if err := service.NotifyReady(); err != nil {
+				log.Printf("vpsagent: unable to report service readiness: %v", err)
+			}
+		}
+	}()
 	<-ctx.Done()
 }
 

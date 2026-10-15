@@ -41,7 +41,9 @@ sent in this live view.
 
 Saved incident process/container snapshots remain a separate option, disabled
 unless `VPSAGENT_INCIDENT_SNAPSHOTS=true`. Normal Cloud resource uploads continue
-if a live-process request fails.
+if a live-process request fails. Incident captures are limited to 100 containers,
+bounded text fields, and the 256 KiB request budget. If optional details cannot
+fit or Cloud rejects them, the agent retries the resource heartbeat without them.
 
 ## Collection freshness
 
@@ -49,8 +51,10 @@ Cloud uploads require a measurement collected within the last minute. The agent
 uploads each advancing collection timestamp once, skips frozen samples, and
 resumes when fresh collection returns. Cloud also persists timestamp progress so
 new upload IDs cannot make an old measurement look current. Keep the VPS clock
-synced with NTP; Cloud tolerates five minutes of clock skew. A collection conflict
-(HTTP 409) is retried without permanently stopping the uploader.
+synced with NTP; Cloud tolerates five minutes of clock skew. A rejected or
+superseded measurement (HTTP 400, 409, 413, or 422) is skipped, and the next fresh
+measurement remains eligible. Other transient failures use bounded backoff;
+only credential rejection stops the uploader until reconfiguration and restart.
 
 Optional Docker, GPU and process collection shares a three-second deadline and a
 1 MiB output limit; timed-out Unix commands are terminated as a process group.
@@ -58,6 +62,13 @@ Disk capacity probes use a bounded worker pool and collection deadline. A blocke
 filesystem cannot stop CPU, memory and network samples. Unavailable disk readings
 are omitted rather than relabeled as fresh. ZFS datasets and mount paths with
 escaped characters are supported.
+
+Disk lists always serialize as arrays, including when no readings are available.
+The `X-Vpsagent-Disk-Status` request header reports `complete`, `partial`, or
+`unavailable`; newer Cloud versions preserve disk alerts until complete readings
+prove recovery. Older Cloud versions ignore the header and keep accepting the
+resource JSON. Deploy the Cloud change before the agent to preserve unknown disk
+status throughout a rollout.
 
 ## Updates from Cloud
 
@@ -91,9 +102,13 @@ cannot accept a command, download URL, or installation path from Cloud. Signing
 uses GitHub Actions OIDC; no reusable release signing secret is stored in CI.
 
 The helper atomically replaces `/opt/vpsagent/vpsagent`, restarts its service,
-and checks that the same service process stays running. Failed startup restores
-`vpsagent.previous`. A root-owned journal recovers interrupted installations at
-boot; interrupted downloads leave the current binary in place. Cloud retains up
+and waits for the agent to report readiness after a fresh collection and its
+first upload attempt. A Cloud outage does not block readiness. Failed startup
+restores `vpsagent.previous`. A separate stable recovery executable and
+root-owned boot unit recover interrupted replacements before the agent starts.
+This recovery unit is installed for every new installation and provisioned by
+manual updates and remote-update setup, regardless of remote update opt-in.
+Interrupted downloads leave the current binary in place. Cloud retains up
 to 20 update jobs per server and expires unfinished jobs after 15 minutes. Keep
 the VPS clock synchronized. Updates require outbound HTTPS access to GitHub and
 the Sigstore TUF service. A restart briefly interrupts telemetry.
@@ -107,4 +122,16 @@ Tests: `go test -race ./...`. The isolated Linux/systemd integration test is
 explicit: build `go test -c ./internal/update`, then run the test binary as root
 with `VPSAGENT_SYSTEMD_TEST=1 -test.run TestSystemdUpdateAndRollback`. It uses
 unique temporary units, exercises an unprivileged request in a read-only mount
-namespace, tests success and failed-start rollback, and cleans up its own units.
+namespace, confirms a failed Cloud connection still reaches notify readiness,
+confirms a process that never sends READY rolls back, and cleans up its units.
+Release CI runs this test on its Ubuntu systemd host with `sudo`.
+
+## Coordinated library releases
+
+This change targets `vpsmonlib v0.0.8`. Publish the matching library tree before
+merging or releasing the agent dependency update. The dependency checksum covers
+that exact tree; any subsequent library edits require refreshing the checksum.
+For unpublished local changes, use a temporary Go workspace containing both
+repositories and a workspace replacement pointing the library module to its
+local checkout. Published agent builds use the pinned module without local path
+replacements.

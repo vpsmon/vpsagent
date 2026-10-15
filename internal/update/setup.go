@@ -43,6 +43,9 @@ func Enable(ctx context.Context) error {
 	if err != nil || installed != Version {
 		return errors.New("run the installed release binary to enable updates")
 	}
+	if err := installRecovery(ctx); err != nil {
+		return err
+	}
 	u, err := user.Lookup("vpsagent")
 	if err != nil {
 		return err
@@ -109,6 +112,9 @@ func Enable(ctx context.Context) error {
 		if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 			return err
 		}
+		if err := exec.CommandContext(ctx, "systemctl", "enable", "--now", "vpsagent-recover.service").Run(); err != nil {
+			return err
+		}
 		if err := exec.CommandContext(ctx, "systemctl", "enable", "--now", "vpsagent-update.service", "vpsagent-update.path").Run(); err != nil {
 			return err
 		}
@@ -124,6 +130,21 @@ func Disable(ctx context.Context) error {
 	}
 	// Stop watching immediately; allow an in-progress verified update to finish.
 	return exec.CommandContext(ctx, "systemctl", "disable", "--now", "vpsagent-update.path").Run()
+}
+
+// RecoverAtBoot is the stable recovery entry point used by the boot unit.
+func RecoverAtBoot(ctx context.Context) error {
+	if os.Geteuid() != 0 {
+		return errors.New("run boot recovery as root")
+	}
+	if err := ensureRootDirectory(ControlDir); err != nil {
+		return err
+	}
+	if err := makeDirectoryTraversable(ControlDir, 0); err != nil {
+		return err
+	}
+	e := Production()
+	return e.RecoverAtBoot(ctx)
 }
 
 func runAfterUnlock(unlock func(), action func() error) error {
@@ -170,7 +191,7 @@ func ApplyPending(ctx context.Context) error {
 	}
 	defer unlock()
 	engine := Production()
-	if err := engine.recover(ctx); err != nil {
+	if err := engine.recover(ctx, true); err != nil {
 		return err
 	}
 	path := filepath.Join(ControlDir, "requests", "update.json")
@@ -201,13 +222,27 @@ func UpdateLatest(ctx context.Context) error {
 	if err := ensureTrustedUpdateDirs(); err != nil {
 		return err
 	}
+	// Provision and start recovery before taking the updater lock. A recovery
+	// unit started by the agent restart must never wait on the lock held here.
+	if err := installRecovery(ctx); err != nil {
+		return err
+	}
+	if err := exec.CommandContext(ctx, "systemctl", "enable", "vpsagent-recover.service").Run(); err != nil {
+		return err
+	}
+	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	if err := exec.CommandContext(ctx, "systemctl", "start", "vpsagent-recover.service").Run(); err != nil {
+		return err
+	}
 	unlock, err := acquireUpdateLock(ctx, ControlDir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	e := Production()
-	if err := e.recover(ctx); err != nil {
+	if err := e.recover(ctx, true); err != nil {
 		return err
 	}
 	current, err := e.CurrentVersion(ctx)
@@ -226,6 +261,61 @@ func UpdateLatest(ctx context.Context) error {
 	}
 	r := Request{ID: fmt.Sprintf("upd_manual_%d", time.Now().UnixNano()), TargetVersion: target, ExpiresAt: time.Now().Add(10 * time.Minute)}
 	return e.applyLocked(ctx, r)
+}
+
+// installRecovery installs a stable copy of the current authenticated updater
+// and a boot unit ordered before the agent. It is independent of remote opt-in.
+func installRecovery(ctx context.Context) error {
+	if os.Geteuid() != 0 {
+		return errors.New("run recovery setup as root")
+	}
+	if err := trustedPath(InstallDir, true); err != nil {
+		return err
+	}
+	if err := trustedPath(filepath.Join(InstallDir, "vpsagent"), false); err != nil {
+		return err
+	}
+	helper := filepath.Join(InstallDir, "vpsagent-recovery")
+	if _, err := os.Lstat(helper); errors.Is(err, os.ErrNotExist) {
+		if err := linkRecoveryExecutable(filepath.Join(InstallDir, "vpsagent"), helper); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := trustedPath(helper, false); err != nil {
+		return err
+	}
+	unit, err := assets.Files.ReadFile("scripts/vpsagent-recover.service")
+	if err != nil {
+		return err
+	}
+	if err := writeSetupFile("/etc/systemd/system/vpsagent-recover.service", unit, 0644); err != nil {
+		return err
+	}
+	dropIn := "/etc/systemd/system/vpsagent.service.d"
+	if err := os.MkdirAll(dropIn, 0755); err != nil {
+		return err
+	}
+	if err := trustedPath(dropIn, true); err != nil {
+		return err
+	}
+	capable, err := supportsSystemdNotify(ctx, filepath.Join(InstallDir, "vpsagent"))
+	if err != nil {
+		return err
+	}
+	serviceType := "simple"
+	if capable {
+		serviceType = "notify"
+	}
+	dropInData := []byte("[Unit]\nRequires=vpsagent-recover.service\nAfter=vpsagent-recover.service\n[Service]\nType=" + serviceType + "\nNotifyAccess=main\nTimeoutStartSec=60\n")
+	if err := writeSetupFile(filepath.Join(dropIn, "recovery.conf"), dropInData, 0644); err != nil {
+		return err
+	}
+	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, "systemctl", "enable", "vpsagent-recover.service").Run()
 }
 
 func latestRelease(ctx context.Context) (string, error) {

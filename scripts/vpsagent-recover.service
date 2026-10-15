@@ -1,0 +1,21 @@
+[Unit]
+Description=Recover an interrupted VPSmon agent update
+DefaultDependencies=no
+After=local-fs.target
+Before=vpsagent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/vpsagent/vpsagent-recovery recover-update --boot
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/vpsagent /var/lib/vpsagent-control /etc/systemd/system/vpsagent.service.d
+
+[Install]
+WantedBy=multi-user.target

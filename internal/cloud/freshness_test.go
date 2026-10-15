@@ -58,7 +58,7 @@ func TestUploaderSkipsFrozenSamplesAndRecoversAfterConflict(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	client.Start(ctx)
-	for range 2 {
+	for range 1 {
 		select {
 		case <-received:
 		case <-time.After(time.Second):
@@ -66,13 +66,13 @@ func TestUploaderSkipsFrozenSamplesAndRecoversAfterConflict(t *testing.T) {
 		}
 	}
 	time.Sleep(50 * time.Millisecond)
-	if calls.Load() != 2 {
+	if calls.Load() != 1 {
 		t.Fatalf("frozen sample uploaded repeatedly: %d", calls.Load())
 	}
 	old := time.Now().Add(-2 * time.Minute)
 	stamp.Store(&old)
 	time.Sleep(30 * time.Millisecond)
-	if calls.Load() != 2 {
+	if calls.Load() != 1 {
 		t.Fatal("stale collection uploaded")
 	}
 	next := time.Now()

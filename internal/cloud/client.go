@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,6 +56,8 @@ type Client struct {
 	snapshotActive map[string]bool
 	collectLive    func() ([]metrics.TopProcess, []metrics.TopProcess)
 	latest         func() (metrics.Metrics, bool)
+	ready          chan struct{}
+	readyOnce      sync.Once
 }
 
 // New validates an enabled Cloud configuration. HTTP is only permitted for an
@@ -64,7 +67,7 @@ func New(config Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(config.Token) == "" {
+	if !validCloudToken(config.Token) {
 		return nil, fmt.Errorf("VPSAGENT_CLOUD_TOKEN is required when Cloud is enabled")
 	}
 	basePath := strings.TrimRight(endpoint.Path, "/")
@@ -86,6 +89,7 @@ func New(config Config) (*Client, error) {
 		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
 		collectLive: metrics.CollectProcessDetails,
 		latest:      metrics.GetLatest,
+		ready:       make(chan struct{}),
 	}, nil
 }
 
@@ -148,14 +152,14 @@ func (c *Client) Start(ctx context.Context) {
 			stale = false
 		}
 		err := c.Send(ctx, sample)
-		if err == nil {
+		if err == nil || sampleRejected(err) {
 			lastUploaded = sample.Timestamp
 		}
 		return true, err
 	})
 }
 
-// run owns only the optional upload loop. Permanent credential/client errors
+// run owns only the optional upload loop. Permanent credential errors
 // stop this goroutine, never the local collector or dashboard.
 func (c *Client) run(ctx context.Context, send func(context.Context) (bool, error)) {
 	interval := c.interval
@@ -204,15 +208,18 @@ func (c *Client) run(ctx context.Context, send func(context.Context) (bool, erro
 					failures++
 					nextAttempt = time.Now().Add(retryDelay(interval, failures, statusErr))
 					continue
-				case statusErr.statusCode >= 400 && statusErr.statusCode < 500 &&
-					statusErr.statusCode != http.StatusRequestTimeout && statusErr.statusCode != http.StatusTooEarly &&
-					statusErr.statusCode != http.StatusTooManyRequests && statusErr.statusCode != http.StatusConflict:
-					c.logger.Printf("vpsagent: telemetry rejected (HTTP %d); uploads paused until restart or reconfiguration", statusErr.statusCode)
-					return
 				}
 			}
 			if failures == 0 {
 				c.logger.Printf("vpsagent: metrics upload failed: %v", err)
+			}
+			if sampleRejected(err) {
+				// The next sample can be valid even when this one was not.
+				// Do not let repeated rejected measurements build a long
+				// transport backoff that delays newly recovered collection.
+				failures = 1
+				nextAttempt = time.Now().Add(interval)
+				continue
 			}
 			failures++
 			delay := retryDelay(interval, failures, statusErr)
@@ -224,6 +231,13 @@ func (c *Client) run(ctx context.Context, send func(context.Context) (bool, erro
 type responseError struct {
 	statusCode int
 	retryAfter time.Duration
+}
+
+// A malformed measurement cannot improve when replayed. The next completed
+// measurement is still eligible, and the run loop retains its bounded backoff.
+func sampleRejected(err error) bool {
+	var status *responseError
+	return errors.As(err, &status) && (status.statusCode == http.StatusBadRequest || status.statusCode == http.StatusConflict || status.statusCode == http.StatusRequestEntityTooLarge || status.statusCode == http.StatusUnprocessableEntity)
 }
 
 func (e *responseError) Error() string { return fmt.Sprintf("cloud returned HTTP %d", e.statusCode) }
@@ -281,9 +295,23 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 	if err != nil {
 		return fmt.Errorf("create sample id: %w", err)
 	}
-	payload, err := json.Marshal(envelope{Version: 1, SampleID: sampleID, SentAt: time.Now().UTC(), Metrics: telemetryFrom(sample), IncidentSnapshot: c.snapshotFor(sample)})
+	message := envelope{Version: 1, SampleID: sampleID, SentAt: time.Now().UTC(), Metrics: telemetryFrom(sample), IncidentSnapshot: c.snapshotFor(sample)}
+	return c.sendEnvelope(ctx, sample, message)
+}
+
+func (c *Client) sendEnvelope(ctx context.Context, sample metrics.Metrics, message envelope) error {
+	payload, err := json.Marshal(message)
+	// Optional details must never make a valid resource heartbeat unencodable or
+	// exceed Cloud's whole-request budget.
+	if message.IncidentSnapshot != nil && (err != nil || len(payload) > maxTelemetryBytes) {
+		message.IncidentSnapshot = nil
+		payload, err = json.Marshal(message)
+	}
 	if err != nil {
 		return fmt.Errorf("encode metrics: %w", err)
+	}
+	if len(payload) > maxTelemetryBytes {
+		return errors.New("resource metrics exceed Cloud payload limit")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.metricsURL, bytes.NewReader(payload))
 	if err != nil {
@@ -292,13 +320,27 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Vpsagent-Live", "1")
+	req.Header.Set("X-Vpsagent-Disk-Status", sample.DiskCollectionStatus)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			c.markReady(sample)
+		}
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode >= 500 || resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusTooEarly {
+		c.markReady(sample)
+	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		// A snapshot rejected by a newer/stricter server must not suppress core
+		// telemetry. Retry the same measurement once without optional details.
+		if message.IncidentSnapshot != nil && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge || resp.StatusCode == http.StatusUnprocessableEntity) {
+			_ = resp.Body.Close()
+			message.IncidentSnapshot = nil
+			return c.sendEnvelope(ctx, sample, message)
+		}
 		return &responseError{statusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	c.commitSnapshotState(sample)
@@ -308,6 +350,23 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 		_ = c.sendLive(ctx)
 	}
 	return nil
+}
+
+// Ready closes after a fresh, structurally valid core measurement reaches the
+// transport. Remote outages and billing pauses do not make a local update bad;
+// payload rejection, invalid credentials and absent collection do.
+func (c *Client) Ready() <-chan struct{} { return c.ready }
+
+func (c *Client) markReady(sample metrics.Metrics) {
+	if c.ready == nil || !freshSample(sample, time.Now()) || sample.MemTotal == 0 || sample.CPUCount <= 0 {
+		return
+	}
+	for _, value := range []float64{sample.CPUUsage, sample.MemPercent, sample.SwapPercent} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 100 {
+			return
+		}
+	}
+	c.readyOnce.Do(func() { close(c.ready) })
 }
 
 func freshSample(sample metrics.Metrics, now time.Time) bool {
@@ -392,12 +451,16 @@ type telemetry struct {
 }
 
 func telemetryFrom(m metrics.Metrics) telemetry {
+	disks := m.Disks
+	if disks == nil {
+		disks = []metrics.DiskInfo{}
+	}
 	return telemetry{
 		Hostname: m.Hostname, Uptime: m.Uptime, LoadAvg: m.LoadAvg,
 		CPUCount: m.CPUCount, CPUUsage: m.CPUUsage,
 		MemTotal: m.MemTotal, MemUsed: m.MemUsed, MemPercent: m.MemPercent,
 		SwapTotal: m.SwapTotal, SwapUsed: m.SwapUsed, SwapPercent: m.SwapPercent,
-		Disks: m.Disks, NetRx: m.NetRx, NetTx: m.NetTx,
+		Disks: disks, NetRx: m.NetRx, NetTx: m.NetTx,
 		NetRxSpeed: m.NetRxSpeed, NetTxSpeed: m.NetTxSpeed,
 		Processes: m.Processes, Timestamp: m.Timestamp.UTC(),
 	}
@@ -425,7 +488,7 @@ func (c *Client) snapshotFor(m metrics.Metrics) *incidentSnapshot {
 	if len(triggers) == 0 {
 		return nil
 	}
-	return &incidentSnapshot{Triggers: triggers, CapturedAt: time.Now().UTC(), TopCPU: m.TopCPU, TopMem: m.TopMem, Containers: m.Containers}
+	return &incidentSnapshot{Triggers: triggers, CapturedAt: time.Now().UTC(), TopCPU: boundedProcesses(m.TopCPU), TopMem: boundedProcesses(m.TopMem), Containers: boundedContainers(m.Containers)}
 }
 
 func (c *Client) commitSnapshotState(m metrics.Metrics) {
@@ -441,6 +504,9 @@ func (c *Client) commitSnapshotState(m metrics.Metrics) {
 	c.snapshotMu.Lock()
 	c.snapshotActive["cpu"] = m.CPUUsage >= c.threshold
 	c.snapshotActive["memory"] = m.MemPercent >= c.threshold
-	c.snapshotActive["disk"] = diskPercent >= c.threshold
+	// A missing disk must not rearm an incident capture as if pressure cleared.
+	if m.DiskCollectionStatus == metrics.DiskCollectionComplete || m.DiskCollectionStatus == "" || diskPercent >= c.threshold {
+		c.snapshotActive["disk"] = diskPercent >= c.threshold
+	}
 	c.snapshotMu.Unlock()
 }
