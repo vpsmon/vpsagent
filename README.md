@@ -128,9 +128,9 @@ Release CI runs this test on its Ubuntu systemd host with `sudo`.
 
 ## Coordinated library releases
 
-This change targets `vpsmonlib v0.0.8`. Publish the matching library tree before
-merging or releasing the agent dependency update. The dependency checksum covers
-that exact tree; any subsequent library edits require refreshing the checksum.
+The agent uses the published `vpsmonlib v0.0.8` module. For future shared-library
+changes, publish the matching library release before updating the agent's module
+version and checksums.
 For unpublished local changes, use a temporary Go workspace containing both
 repositories and a workspace replacement pointing the library module to its
 local checkout. Published agent builds use the pinned module without local path
