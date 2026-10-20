@@ -291,12 +291,30 @@ func (c *Client) Send(ctx context.Context, sample metrics.Metrics) error {
 	if !freshSample(sample, time.Now()) {
 		return errors.New("refusing stale or invalid metric timestamp")
 	}
+	// An unsupported mount must not invalidate the resource heartbeat or make
+	// missing disk readings look like a complete recovery.
+	sample.Disks, sample.DiskCollectionStatus = telemetryDisks(sample.Disks, sample.DiskCollectionStatus)
 	sampleID, err := newSampleID()
 	if err != nil {
 		return fmt.Errorf("create sample id: %w", err)
 	}
 	message := envelope{Version: 1, SampleID: sampleID, SentAt: time.Now().UTC(), Metrics: telemetryFrom(sample), IncidentSnapshot: c.snapshotFor(sample)}
 	return c.sendEnvelope(ctx, sample, message)
+}
+
+func telemetryDisks(disks []metrics.DiskInfo, status string) ([]metrics.DiskInfo, string) {
+	result := make([]metrics.DiskInfo, 0, min(len(disks), 128))
+	for _, disk := range disks {
+		if len(disk.Mount) > 1024 || len(disk.Device) > 1024 || !validPercent(disk.Percent, 100) || len(result) == 128 {
+			status = metrics.DiskCollectionPartial
+			continue
+		}
+		result = append(result, disk)
+	}
+	if len(result) == 0 && len(disks) > 0 {
+		status = metrics.DiskCollectionUnavailable
+	}
+	return result, status
 }
 
 func (c *Client) sendEnvelope(ctx context.Context, sample metrics.Metrics, message envelope) error {

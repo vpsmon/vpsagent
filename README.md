@@ -64,6 +64,9 @@ are omitted rather than relabeled as fresh. ZFS datasets and mount paths with
 escaped characters are supported.
 
 Disk lists always serialize as arrays, including when no readings are available.
+Disk entries that exceed Cloud's field limits or contain invalid percentages
+are omitted so one unsupported mount cannot block the resource heartbeat.
+Omissions report partial or unavailable disk collection rather than recovery.
 The `X-Vpsagent-Disk-Status` request header reports `complete`, `partial`, or
 `unavailable`; newer Cloud versions preserve disk alerts until complete readings
 prove recovery. Older Cloud versions ignore the header and keep accepting the

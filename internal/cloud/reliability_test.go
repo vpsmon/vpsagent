@@ -51,6 +51,67 @@ func TestUnavailableDisksRemainAnArrayAndUseCompatibleHeader(t *testing.T) {
 	}
 }
 
+func TestUnsupportedDisksDoNotBlockHeartbeatOrReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		disks        []metrics.DiskInfo
+		wantCount    int
+		wantStatus   string
+	}{
+		{"long mount", metrics.DiskCollectionComplete, []metrics.DiskInfo{{Mount: "/ok"}, {Mount: "/" + strings.Repeat("nested/", 170)}}, 1, metrics.DiskCollectionPartial},
+		{"long device", metrics.DiskCollectionComplete, []metrics.DiskInfo{{Device: strings.Repeat("x", 1025)}}, 0, metrics.DiskCollectionUnavailable},
+		{"invalid percentage", "", []metrics.DiskInfo{{Percent: math.NaN()}, {Percent: math.Inf(1)}, {Percent: -1}, {Percent: 101}}, 0, metrics.DiskCollectionUnavailable},
+		{"boundary", metrics.DiskCollectionPartial, []metrics.DiskInfo{{Mount: strings.Repeat("é", 512), Device: strings.Repeat("d", 1024), Percent: 100}}, 1, metrics.DiskCollectionPartial},
+		{"count limit", metrics.DiskCollectionComplete, make([]metrics.DiskInfo, 129), 128, metrics.DiskCollectionPartial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var body envelope
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					http.Error(w, "invalid JSON", 400)
+					return
+				}
+				for _, disk := range body.Metrics.Disks {
+					if len(disk.Mount) > 1024 || len(disk.Device) > 1024 || !validPercent(disk.Percent, 100) {
+						http.Error(w, "invalid disk metrics", 400)
+						return
+					}
+				}
+				if body.Metrics.Disks == nil || len(body.Metrics.Disks) != tc.wantCount || r.Header.Get("X-Vpsagent-Disk-Status") != tc.wantStatus {
+					t.Errorf("disks=%#v status=%q", body.Metrics.Disks, r.Header.Get("X-Vpsagent-Disk-Status"))
+				}
+				w.WriteHeader(204)
+			}))
+			defer server.Close()
+			client, err := New(Config{URL: server.URL, Token: "test", EnableSnapshots: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.httpClient = server.Client()
+			client.snapshotActive["disk"] = true
+			sample := readySample()
+			sample.Disks, sample.DiskCollectionStatus = tc.disks, tc.status
+			if err := client.Send(t.Context(), sample); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-client.Ready():
+			default:
+				t.Fatal("valid core heartbeat did not report readiness")
+			}
+			if calls != 1 || !client.snapshotActive["disk"] {
+				t.Fatalf("requests=%d disk incident active=%t", calls, client.snapshotActive["disk"])
+			}
+			if len(sample.Disks) != len(tc.disks) || sample.DiskCollectionStatus != tc.status {
+				t.Fatal("sending changed the collector sample")
+			}
+		})
+	}
+}
+
 func TestRunContinuesAfterRejectedSamples(t *testing.T) {
 	for _, status := range []int{400, 404, 413, 422} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
