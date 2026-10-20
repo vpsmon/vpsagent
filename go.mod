@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/theupdateframework/go-tuf/v2 v2.4.2
-	github.com/vpsmon/vpsmonlib v0.0.8
+	github.com/vpsmon/vpsmonlib v0.0.9
 )
 
 require (

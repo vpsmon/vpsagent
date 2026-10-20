@@ -131,7 +131,7 @@ Release CI runs this test on its Ubuntu systemd host with `sudo`.
 
 ## Coordinated library releases
 
-The agent uses the published `vpsmonlib v0.0.8` module. For future shared-library
+The agent uses the published `vpsmonlib v0.0.9` module. For future shared-library
 changes, publish the matching library release before updating the agent's module
 version and checksums.
 For unpublished local changes, use a temporary Go workspace containing both
