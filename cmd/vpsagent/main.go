@@ -109,7 +109,9 @@ normal:
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	client.StartControl(ctx, update.Version)
-	metrics.StartCollectorWithOptions(metrics.Options{TopProcesses: snapshots, Containers: snapshots})
+	// Incident captures measure processes on demand at a threshold crossing,
+	// so the periodic collector does not scan them.
+	metrics.StartCollectorWithOptions(metrics.Options{Containers: snapshots})
 	log.Printf("vpsagent %s collecting local metrics and uploading to %s", update.Version, cloudURL)
 	client.Start(ctx)
 	go func() {

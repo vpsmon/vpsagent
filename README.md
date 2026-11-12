@@ -35,12 +35,15 @@ Selecting **Show live processes** in Cloud requests up to five process names and
 CPU/memory percentages on subsequent heartbeats. These details go to a separate
 endpoint, stay briefly in Cloud memory, and never enter the metrics database or
 backups. Closing/stopping the view ends requests; the lease expires after 30
-seconds without renewal. CPU comes from `ps` and is the process lifetime average.
+seconds without renewal. CPU is measured over one second as a share of the whole
+server, and processes with the same name are combined with a count.
 Command arguments, environment variables, logs, sockets, and containers are not
 sent in this live view.
 
 Saved incident process/container snapshots remain a separate option, disabled
-unless `VPSAGENT_INCIDENT_SNAPSHOTS=true`. Normal Cloud resource uploads continue
+unless `VPSAGENT_INCIDENT_SNAPSHOTS=true`. The agent then captures processes when
+a reading first reaches the workspace's alert threshold, which Cloud returns with
+each accepted upload (90% before the first answer). Normal Cloud resource uploads continue
 if a live-process request fails. Incident captures are limited to 100 containers,
 bounded text fields, and the 256 KiB request budget. If optional details cannot
 fit or Cloud rejects them, the agent retries the resource heartbeat without them.

@@ -348,3 +348,84 @@ func TestIncidentSnapshotIsOptInAndOnlySentOnThresholdCrossing(t *testing.T) {
 		t.Fatal("new threshold crossing did not include snapshot")
 	}
 }
+
+func TestIncidentSnapshotUsesCloudThresholdsAndCollectsOnDemand(t *testing.T) {
+	var payloads []map[string]any
+	var supportHeaders []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		payloads = append(payloads, payload)
+		supportHeaders = append(supportHeaders, r.Header.Get(captureSupportHeader))
+		w.Header().Set(captureThresholdsHeader, "cpu=70; memory=0;disk=nan;gpu=5;bogus")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := New(Config{URL: server.URL, Token: "agent-token", EnableSnapshots: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.httpClient = server.Client()
+	collected := 0
+	client.collectLive = func() ([]metrics.TopProcess, []metrics.TopProcess) {
+		collected++
+		return []metrics.TopProcess{{Name: "worker", CPU: 74, Count: 3}}, []metrics.TopProcess{{Name: "db", Mem: 30}}
+	}
+	sample := metrics.Metrics{Timestamp: time.Now(), CPUUsage: 75, MemPercent: 40}
+	for range 2 {
+		if err := client.Send(context.Background(), sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if supportHeaders[0] != "1" {
+		t.Fatal("agent did not announce capture support")
+	}
+	if _, ok := payloads[0]["incident_snapshot"]; ok {
+		t.Fatal("captured below the default threshold before Cloud sent its policy")
+	}
+	snapshot, ok := payloads[1]["incident_snapshot"].(map[string]any)
+	if !ok || collected != 1 {
+		t.Fatalf("no capture at Cloud threshold: %v (collected %d)", payloads[1], collected)
+	}
+	if triggers := snapshot["triggers"].([]any); len(triggers) != 1 || triggers[0] != "cpu" {
+		t.Fatalf("triggers = %v", triggers)
+	}
+	top := snapshot["top_cpu"].([]any)[0].(map[string]any)
+	if top["name"] != "worker" || top["count"] != float64(3) {
+		t.Fatalf("on-demand processes = %v", top)
+	}
+	client.snapshotMu.Lock()
+	defer client.snapshotMu.Unlock()
+	if client.thresholds["memory"] != 90 || client.thresholds["disk"] != 90 || client.thresholds["cpu"] != 70 {
+		t.Fatalf("invalid threshold entries applied: %v", client.thresholds)
+	}
+}
+
+func TestCaptureSupportIsNotAnnouncedWithoutSnapshots(t *testing.T) {
+	var header string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header = r.Header.Get(captureSupportHeader)
+		w.Header().Set(captureThresholdsHeader, "cpu=10")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := New(Config{URL: server.URL, Token: "agent-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.httpClient = server.Client()
+	client.collectLive = func() ([]metrics.TopProcess, []metrics.TopProcess) {
+		t.Error("collected processes without opt-in")
+		return nil, nil
+	}
+	for range 2 {
+		if err := client.Send(context.Background(), metrics.Metrics{Timestamp: time.Now(), CPUUsage: 50}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if header != "" {
+		t.Fatalf("capture header = %q without opt-in", header)
+	}
+}

@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,8 +53,8 @@ type Client struct {
 	httpClient     *http.Client
 	logger         *log.Logger
 	snapshots      bool
-	threshold      float64
 	snapshotMu     sync.Mutex
+	thresholds     map[string]float64 // capture thresholds; Cloud's alert policy once known
 	snapshotActive map[string]bool
 	collectLive    func() ([]metrics.TopProcess, []metrics.TopProcess)
 	latest         func() (metrics.Metrics, bool)
@@ -86,7 +88,8 @@ func New(config Config) (*Client, error) {
 	return &Client{
 		metricsURL: endpoint.String(), liveURL: liveURL, controlURL: controlURL, token: config.Token, interval: config.Interval,
 		httpClient: cloudHTTPClient(10 * time.Second), logger: log.Default(),
-		snapshots: config.EnableSnapshots, threshold: config.SnapshotThreshold, snapshotActive: map[string]bool{},
+		snapshots: config.EnableSnapshots, snapshotActive: map[string]bool{},
+		thresholds:  map[string]float64{"cpu": config.SnapshotThreshold, "memory": config.SnapshotThreshold, "disk": config.SnapshotThreshold},
 		collectLive: metrics.CollectProcessDetails,
 		latest:      metrics.GetLatest,
 		ready:       make(chan struct{}),
@@ -338,6 +341,9 @@ func (c *Client) sendEnvelope(ctx context.Context, sample metrics.Metrics, messa
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Vpsagent-Live", "1")
+	if c.snapshots {
+		req.Header.Set(captureSupportHeader, "1")
+	}
 	req.Header.Set("X-Vpsagent-Disk-Status", sample.DiskCollectionStatus)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -361,7 +367,11 @@ func (c *Client) sendEnvelope(ctx context.Context, sample metrics.Metrics, messa
 		}
 		return &responseError{statusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
+	// Record this sample against the thresholds it was judged by before
+	// adopting new ones, so pressure already above a lowered threshold still
+	// gets a capture on the next sample.
 	c.commitSnapshotState(sample)
+	c.applyCaptureThresholds(resp.Header.Get(captureThresholdsHeader))
 	if resp.Header.Get("X-Vpscloud-Live") == "1" {
 		// A failed live view must not mark an accepted resource upload as failed,
 		// replay an incident capture, or stop the normal uploader.
@@ -488,43 +498,80 @@ func (c *Client) snapshotFor(m metrics.Metrics) *incidentSnapshot {
 	if !c.snapshots {
 		return nil
 	}
+	values := snapshotValues(m)
+	c.snapshotMu.Lock()
+	triggers := make([]string, 0, len(values))
+	for _, rule := range snapshotRules {
+		if values[rule] >= c.thresholds[rule] && !c.snapshotActive[rule] {
+			triggers = append(triggers, rule)
+		}
+	}
+	c.snapshotMu.Unlock()
+	if len(triggers) == 0 {
+		return nil
+	}
+	// The agent no longer scans processes on every collection. Measure them
+	// now, at the crossing, unless the sample already carries them.
+	topCPU, topMem := m.TopCPU, m.TopMem
+	if len(topCPU) == 0 && len(topMem) == 0 {
+		topCPU, topMem = c.collectLive()
+	}
+	return &incidentSnapshot{Triggers: triggers, CapturedAt: time.Now().UTC(), TopCPU: boundedProcesses(topCPU), TopMem: boundedProcesses(topMem), Containers: boundedContainers(m.Containers)}
+}
+
+var snapshotRules = []string{"cpu", "memory", "disk"}
+
+func snapshotValues(m metrics.Metrics) map[string]float64 {
 	diskPercent := 0.0
 	for _, disk := range m.Disks {
 		if disk.Percent > diskPercent {
 			diskPercent = disk.Percent
 		}
 	}
-	values := map[string]float64{"cpu": m.CPUUsage, "memory": m.MemPercent, "disk": diskPercent}
-	c.snapshotMu.Lock()
-	defer c.snapshotMu.Unlock()
-	triggers := make([]string, 0, len(values))
-	for rule, value := range values {
-		if value >= c.threshold && !c.snapshotActive[rule] {
-			triggers = append(triggers, rule)
+	return map[string]float64{"cpu": m.CPUUsage, "memory": m.MemPercent, "disk": diskPercent}
+}
+
+const (
+	captureSupportHeader    = "X-Vpsagent-Capture"
+	captureThresholdsHeader = "X-Vpscloud-Capture-Thresholds"
+)
+
+// applyCaptureThresholds adopts the workspace alert thresholds Cloud returns,
+// for example "cpu=80;memory=85;disk=90", so captures happen when the alert
+// condition starts rather than at a fixed level. Older Cloud versions send no
+// header and the configured default remains. Invalid entries are ignored.
+func (c *Client) applyCaptureThresholds(header string) {
+	if !c.snapshots || header == "" || len(header) > 128 {
+		return
+	}
+	updates := map[string]float64{}
+	for _, entry := range strings.Split(header, ";") {
+		rule, raw, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if !ok || !slices.Contains(snapshotRules, rule) {
+			continue
 		}
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(value) || value < 1 || value > 100 {
+			continue
+		}
+		updates[rule] = value
 	}
-	if len(triggers) == 0 {
-		return nil
-	}
-	return &incidentSnapshot{Triggers: triggers, CapturedAt: time.Now().UTC(), TopCPU: boundedProcesses(m.TopCPU), TopMem: boundedProcesses(m.TopMem), Containers: boundedContainers(m.Containers)}
+	c.snapshotMu.Lock()
+	maps.Copy(c.thresholds, updates)
+	c.snapshotMu.Unlock()
 }
 
 func (c *Client) commitSnapshotState(m metrics.Metrics) {
 	if !c.snapshots {
 		return
 	}
-	diskPercent := 0.0
-	for _, disk := range m.Disks {
-		if disk.Percent > diskPercent {
-			diskPercent = disk.Percent
-		}
-	}
+	values := snapshotValues(m)
 	c.snapshotMu.Lock()
-	c.snapshotActive["cpu"] = m.CPUUsage >= c.threshold
-	c.snapshotActive["memory"] = m.MemPercent >= c.threshold
+	c.snapshotActive["cpu"] = values["cpu"] >= c.thresholds["cpu"]
+	c.snapshotActive["memory"] = values["memory"] >= c.thresholds["memory"]
 	// A missing disk must not rearm an incident capture as if pressure cleared.
-	if m.DiskCollectionStatus == metrics.DiskCollectionComplete || m.DiskCollectionStatus == "" || diskPercent >= c.threshold {
-		c.snapshotActive["disk"] = diskPercent >= c.threshold
+	if m.DiskCollectionStatus == metrics.DiskCollectionComplete || m.DiskCollectionStatus == "" || values["disk"] >= c.thresholds["disk"] {
+		c.snapshotActive["disk"] = values["disk"] >= c.thresholds["disk"]
 	}
 	c.snapshotMu.Unlock()
 }
