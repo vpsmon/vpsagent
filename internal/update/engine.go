@@ -341,7 +341,7 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 	}
 	if !idPattern.MatchString(r.ID) || !ValidVersion(r.TargetVersion) || !time.Now().Before(r.ExpiresAt) || r.ExpiresAt.After(time.Now().Add(20*time.Minute)) || (!Newer(r.TargetVersion, current) && r.TargetVersion != current) {
 		e.result(r, "failed", "invalid_request", current)
-		return errors.New("invalid update request")
+		return ErrInvalidRequest
 	}
 	var previous Result
 	if ReadJSON(filepath.Join(e.ControlDir, "result.json"), &previous) == nil && previous.ID == r.ID && previous.Status != "running" {
@@ -787,3 +787,7 @@ func restartConfigWritable(dropInDir, recoveryUnit string) error {
 func configUnwritable(err error) bool {
 	return errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
 }
+
+// ErrInvalidRequest marks a request that was rejected and recorded without
+// changing anything, such as one that expired before the updater ran.
+var ErrInvalidRequest = errors.New("invalid update request")

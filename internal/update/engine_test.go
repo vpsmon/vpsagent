@@ -603,3 +603,15 @@ func TestRestartConfigWritableChecksRecoveryUnitAndDirectory(t *testing.T) {
 		t.Fatal("accepted a missing drop-in directory")
 	}
 }
+
+func TestExpiredRequestIsRecordedAsInvalid(t *testing.T) {
+	e := testEngine(t)
+	expired := request()
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+	if err := e.Apply(t.Context(), expired); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("err = %v, want ErrInvalidRequest", err)
+	}
+	if r := readResult(t, e); r.Status != "failed" || r.Stage != "invalid_request" {
+		t.Fatalf("result = %+v", r)
+	}
+}

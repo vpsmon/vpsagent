@@ -109,7 +109,15 @@ func Enable(ctx context.Context) error {
 		if err := exec.CommandContext(ctx, "systemctl", "enable", "--now", "vpsagent-recover.service").Run(); err != nil {
 			return err
 		}
-		if err := exec.CommandContext(ctx, "systemctl", "enable", "--now", "vpsagent-update.service", "vpsagent-update.path").Run(); err != nil {
+		// The oneshot service runs only when the watcher sees a request, so a
+		// stale request cannot fail this command.
+		if err := exec.CommandContext(ctx, "systemctl", "enable", "vpsagent-update.service").Run(); err != nil {
+			return err
+		}
+		if err := exec.CommandContext(ctx, "systemctl", "reset-failed", "vpsagent-update.path", "vpsagent-update.service").Run(); err != nil {
+			return err
+		}
+		if err := exec.CommandContext(ctx, "systemctl", "enable", "--now", "vpsagent-update.path").Run(); err != nil {
 			return err
 		}
 		return exec.CommandContext(ctx, "systemctl", "restart", "vpsagent.service").Run()
@@ -241,7 +249,12 @@ func ApplyPending(ctx context.Context) error {
 	if !Enabled(ControlDir) {
 		return errors.New("remote updates are disabled")
 	}
-	return engine.applyLocked(ctx, request)
+	// A rejected request is recorded for Cloud. Exiting with an error would
+	// count toward systemd's start limit and can stop the watcher entirely.
+	if err := engine.applyLocked(ctx, request); err != nil && !errors.Is(err, ErrInvalidRequest) {
+		return err
+	}
+	return nil
 }
 
 // UpdateLatest runs an explicit manual update through the same authenticated
