@@ -514,3 +514,92 @@ func TestSignatureRejectsInvalidBundle(t *testing.T) {
 		t.Fatal("accepted unsigned manifest")
 	}
 }
+
+// Older remote-update units made /etc read-only to the sandboxed updater.
+// The update must fail before replacing anything, with a clear result.
+func TestUnwritableRestartConfigFailsBeforeChanges(t *testing.T) {
+	e := testEngine(t)
+	fetched, restarted := false, false
+	e.Fetch = func(context.Context, string, string) (string, error) {
+		fetched = true
+		return "", errors.New("unexpected fetch")
+	}
+	e.Restart = func(context.Context) error { restarted = true; return nil }
+	e.RestartReady = func() error { return &os.PathError{Op: "open", Path: serviceDropInDir, Err: syscall.EROFS} }
+	if err := e.Apply(t.Context(), request()); err == nil {
+		t.Fatal("update proceeded without a writable restart configuration")
+	}
+	if r := readResult(t, e); r.Status != "failed" || r.Stage != "manual_update_required" || r.Version != "v0.0.8" {
+		t.Fatalf("result = %+v", r)
+	}
+	if fetched || restarted {
+		t.Fatal("update fetched or restarted before failing")
+	}
+	if _, err := os.Stat(filepath.Join(e.ControlDir, "journal.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal written: %v", err)
+	}
+	if v, _ := e.CurrentVersion(t.Context()); v != "v0.0.8" {
+		t.Fatalf("binary changed to %s", v)
+	}
+}
+
+// Reproduces servers stuck since an earlier remote update: the backup was
+// already restored, but PrepareRestart cannot write under the old sandbox.
+func TestRecoveryCompletesWhenRestartConfigIsReadOnly(t *testing.T) {
+	e := testEngine(t)
+	restarts := 0
+	e.Restart = func(context.Context) error { restarts++; return nil }
+	e.PrepareRestart = func(context.Context, string) error {
+		return &os.PathError{Op: "open", Path: serviceDropInDir, Err: syscall.EROFS}
+	}
+	WriteJSON(filepath.Join(e.ControlDir, "journal.json"), journal{Request: request(), OldVersion: "v0.0.8", Running: true, BackupReady: true}, 0600)
+	if err := e.Recover(t.Context()); err != nil {
+		t.Fatalf("recovery stayed blocked: %v", err)
+	}
+	var j journal
+	if err := ReadJSON(filepath.Join(e.ControlDir, "journal.json"), &j); err != nil || j.Running {
+		t.Fatalf("journal still running: %+v %v", j, err)
+	}
+	if restarts != 1 {
+		t.Fatalf("restarts = %d", restarts)
+	}
+	// A later update is no longer blocked by the old journal.
+	e.PrepareRestart = nil
+	next := request()
+	next.ID = "upd_next"
+	if err := e.Apply(t.Context(), next); err != nil {
+		t.Fatalf("next update: %v", err)
+	}
+	if v, _ := e.CurrentVersion(t.Context()); v != "v0.0.9" {
+		t.Fatalf("version = %s", v)
+	}
+}
+
+func TestRecoveryStillFailsOnOtherRestartConfigErrors(t *testing.T) {
+	e := testEngine(t)
+	e.PrepareRestart = func(context.Context, string) error { return errors.New("daemon-reload failed") }
+	WriteJSON(filepath.Join(e.ControlDir, "journal.json"), journal{Request: request(), OldVersion: "v0.0.8", Running: true, BackupReady: true}, 0600)
+	if err := e.Recover(t.Context()); err == nil {
+		t.Fatal("recovery ignored an unrelated restart configuration error")
+	}
+}
+
+func TestRestartConfigWritableChecksRecoveryUnitAndDirectory(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(t.TempDir(), "vpsagent-recover.service")
+	if err := restartConfigWritable(dir, unit); err == nil {
+		t.Fatal("accepted a missing recovery unit")
+	}
+	if err := os.WriteFile(unit, []byte("[Unit]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restartConfigWritable(dir, unit); err != nil {
+		t.Fatalf("writable directory rejected: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("probe left files: %v", entries)
+	}
+	if err := restartConfigWritable(filepath.Join(dir, "missing"), unit); err == nil {
+		t.Fatal("accepted a missing drop-in directory")
+	}
+}

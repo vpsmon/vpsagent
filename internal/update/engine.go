@@ -25,8 +25,12 @@ type Engine struct {
 	RefreshHelpers  func(context.Context) error
 	RefreshRecovery func(context.Context) error
 	PrepareRestart  func(context.Context, string) error
-	NotifyCapable   func(context.Context, string) (bool, error)
-	RequireNotify   bool
+	// RestartReady checks, before anything changes, that PrepareRestart will
+	// be able to configure the service. Units written by older setups do not
+	// let the sandboxed remote updater write the service drop-in.
+	RestartReady  func() error
+	NotifyCapable func(context.Context, string) (bool, error)
+	RequireNotify bool
 }
 type journal struct {
 	Request     Request `json:"request"`
@@ -68,11 +72,12 @@ func Production() Engine {
 			serviceType = "notify"
 		}
 		data := []byte("[Unit]\nRequires=vpsagent-recover.service\nAfter=vpsagent-recover.service\n[Service]\nType=" + serviceType + "\nNotifyAccess=main\nTimeoutStartSec=60\n")
-		if err := writeSetupFile("/etc/systemd/system/vpsagent.service.d/recovery.conf", data, 0644); err != nil {
+		if err := writeSetupFile(filepath.Join(serviceDropInDir, "recovery.conf"), data, 0644); err != nil {
 			return err
 		}
 		return exec.CommandContext(ctx, "systemctl", "daemon-reload").Run()
 	}
+	e.RestartReady = func() error { return restartConfigWritable(serviceDropInDir, recoveryUnitPath) }
 	e.RefreshHelpers = refreshInstalledHelpers
 	e.RefreshRecovery = func(ctx context.Context) error {
 		binary := filepath.Join(InstallDir, "vpsagent")
@@ -344,6 +349,13 @@ func (e Engine) applyLocked(ctx context.Context, r Request) (applyErr error) {
 	}
 	if current == r.TargetVersion {
 		return e.result(r, "succeeded", "complete", current)
+	}
+	if e.RestartReady != nil {
+		// Fail before journaling or replacing anything: nothing needs recovery.
+		if err := e.RestartReady(); err != nil {
+			e.result(r, "failed", "manual_update_required", current)
+			return fmt.Errorf("remote update needs a manual update first: %w", err)
+		}
 	}
 	currentInfo, err := os.Lstat(filepath.Join(e.InstallDir, "vpsagent"))
 	if err != nil || !currentInfo.Mode().IsRegular() {
@@ -727,7 +739,10 @@ func (e Engine) recover(ctx context.Context, restart bool) error {
 			}
 		}
 		if e.PrepareRestart != nil {
-			if err := e.PrepareRestart(ctx, j.OldVersion); err != nil {
+			// A configuration this process cannot write was never changed, so it
+			// still matches the restored release. Failing here would keep the
+			// journal open and block every later update.
+			if err := e.PrepareRestart(ctx, j.OldVersion); err != nil && !configUnwritable(err) {
 				return err
 			}
 		}
@@ -748,4 +763,27 @@ func (e Engine) recover(ctx context.Context, restart bool) error {
 	}
 	j.Running = false
 	return WriteJSON(filepath.Join(e.ControlDir, "journal.json"), j, 0600)
+}
+
+const (
+	serviceDropInDir = "/etc/systemd/system/vpsagent.service.d"
+	recoveryUnitPath = "/etc/systemd/system/vpsagent-recover.service"
+)
+
+// restartConfigWritable reports whether the service drop-in can be replaced
+// and the recovery unit it requires is installed.
+func restartConfigWritable(dropInDir, recoveryUnit string) error {
+	if _, err := os.Stat(recoveryUnit); err != nil {
+		return fmt.Errorf("recovery unit unavailable: %w", err)
+	}
+	probe, err := os.CreateTemp(dropInDir, ".write-check-")
+	if err != nil {
+		return fmt.Errorf("service drop-in not writable: %w", err)
+	}
+	name := probe.Name()
+	return errors.Join(probe.Close(), os.Remove(name))
+}
+
+func configUnwritable(err error) bool {
+	return errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
 }

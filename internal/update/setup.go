@@ -79,14 +79,8 @@ func Enable(ctx context.Context) error {
 	if err := os.Chmod(requests, 0700); err != nil {
 		return err
 	}
-	for _, name := range []string{"vpsagent-update.service", "vpsagent-update.path"} {
-		data, err := assets.Files.ReadFile("scripts/" + name)
-		if err != nil {
-			return err
-		}
-		if err := writeSetupFile("/etc/systemd/system/"+name, data, 0644); err != nil {
-			return err
-		}
+	if err := writeRemoteUpdateUnits(); err != nil {
+		return err
 	}
 	dropIn := "/etc/systemd/system/vpsagent.service.d"
 	if err := os.MkdirAll(dropIn, 0755); err != nil {
@@ -121,6 +115,43 @@ func Enable(ctx context.Context) error {
 		return exec.CommandContext(ctx, "systemctl", "restart", "vpsagent.service").Run()
 	})
 }
+
+// writeRemoteUpdateUnits installs this release's sandboxed updater units.
+func writeRemoteUpdateUnits() error {
+	for _, name := range []string{"vpsagent-update.service", "vpsagent-update.path"} {
+		data, err := assets.Files.ReadFile("scripts/" + name)
+		if err != nil {
+			return err
+		}
+		if err := writeSetupFile("/etc/systemd/system/"+name, data, 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refreshRemoteUpdates replaces updater units installed by older releases and
+// re-arms a watcher that systemd stopped after repeated failures. It runs only
+// in the unsandboxed manual updater and only when remote updates are on.
+func refreshRemoteUpdates(ctx context.Context) error {
+	if !Enabled(ControlDir) {
+		return nil
+	}
+	if err := writeRemoteUpdateUnits(); err != nil {
+		return err
+	}
+	for _, args := range [][]string{
+		{"daemon-reload"},
+		{"reset-failed", "vpsagent-update.path", "vpsagent-update.service"},
+		{"enable", "--now", "vpsagent-update.path"},
+	} {
+		if err := exec.CommandContext(ctx, "systemctl", args...).Run(); err != nil {
+			return fmt.Errorf("systemctl %s: %w", strings.Join(args, " "), err)
+		}
+	}
+	return nil
+}
+
 func Disable(ctx context.Context) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run with sudo")
@@ -234,6 +265,9 @@ func UpdateLatest(ctx context.Context) error {
 		return err
 	}
 	if err := exec.CommandContext(ctx, "systemctl", "start", "vpsagent-recover.service").Run(); err != nil {
+		return err
+	}
+	if err := refreshRemoteUpdates(ctx); err != nil {
 		return err
 	}
 	unlock, err := acquireUpdateLock(ctx, ControlDir)
