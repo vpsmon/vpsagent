@@ -40,10 +40,17 @@ server, and processes with the same name are combined with a count.
 Command arguments, environment variables, logs, sockets, and containers are not
 sent in this live view.
 
-Saved incident process/container snapshots remain a separate option, disabled
-unless `VPSAGENT_INCIDENT_SNAPSHOTS=true`. The agent then captures processes when
-a reading first reaches the workspace's alert threshold, which Cloud returns with
-each accepted upload (90% before the first answer). Normal Cloud resource uploads continue
+Saved incident snapshots are a separate option, off by default.
+`VPSAGENT_INCIDENT_SNAPSHOTS` controls them on the server:
+
+- unset: follow the Cloud workspace setting **Include top processes in alerts**.
+  The agent captures top processes only while Cloud confirms the setting is on.
+- `true`: always capture processes and containers, regardless of the workspace setting.
+- `false`: never capture.
+
+Captures happen when a reading first reaches the workspace's alert threshold,
+which Cloud returns with each accepted upload (90% before the first answer with
+`true`). Process lists are measured on demand at that moment. Normal Cloud resource uploads continue
 if a live-process request fails. Incident captures are limited to 100 containers,
 bounded text fields, and the 256 KiB request budget. If optional details cannot
 fit or Cloud rejects them, the agent retries the resource heartbeat without them.

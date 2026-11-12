@@ -36,12 +36,15 @@ const (
 
 // Config contains credentials scoped to one server, never a Cloud user.
 type Config struct {
-	URL               string
-	Token             string
-	Interval          time.Duration
-	AllowInsecure     bool
-	EnableSnapshots   bool
-	SnapshotThreshold float64
+	URL             string
+	Token           string
+	Interval        time.Duration
+	AllowInsecure   bool
+	EnableSnapshots bool
+	// FollowCloudCaptures captures only while Cloud's workspace setting is on.
+	// It applies when the server has no local snapshot setting.
+	FollowCloudCaptures bool
+	SnapshotThreshold   float64
 }
 
 type Client struct {
@@ -53,6 +56,7 @@ type Client struct {
 	httpClient     *http.Client
 	logger         *log.Logger
 	snapshots      bool
+	followCloud    bool // captures only while Cloud returns thresholds
 	snapshotMu     sync.Mutex
 	thresholds     map[string]float64 // capture thresholds; Cloud's alert policy once known
 	snapshotActive map[string]bool
@@ -85,11 +89,16 @@ func New(config Config) (*Client, error) {
 	if config.SnapshotThreshold <= 0 {
 		config.SnapshotThreshold = 90
 	}
+	thresholds := map[string]float64{}
+	if config.EnableSnapshots {
+		// A local opt-in captures at the configured level until Cloud answers.
+		thresholds = map[string]float64{"cpu": config.SnapshotThreshold, "memory": config.SnapshotThreshold, "disk": config.SnapshotThreshold}
+	}
 	return &Client{
 		metricsURL: endpoint.String(), liveURL: liveURL, controlURL: controlURL, token: config.Token, interval: config.Interval,
 		httpClient: cloudHTTPClient(10 * time.Second), logger: log.Default(),
-		snapshots: config.EnableSnapshots, snapshotActive: map[string]bool{},
-		thresholds:  map[string]float64{"cpu": config.SnapshotThreshold, "memory": config.SnapshotThreshold, "disk": config.SnapshotThreshold},
+		snapshots: config.EnableSnapshots || config.FollowCloudCaptures, followCloud: config.FollowCloudCaptures && !config.EnableSnapshots,
+		snapshotActive: map[string]bool{}, thresholds: thresholds,
 		collectLive: metrics.CollectProcessDetails,
 		latest:      metrics.GetLatest,
 		ready:       make(chan struct{}),
@@ -341,7 +350,9 @@ func (c *Client) sendEnvelope(ctx context.Context, sample metrics.Metrics, messa
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Vpsagent-Live", "1")
-	if c.snapshots {
+	if c.followCloud {
+		req.Header.Set(captureSupportHeader, "auto")
+	} else if c.snapshots {
 		req.Header.Set(captureSupportHeader, "1")
 	}
 	req.Header.Set("X-Vpsagent-Disk-Status", sample.DiskCollectionStatus)
@@ -502,7 +513,7 @@ func (c *Client) snapshotFor(m metrics.Metrics) *incidentSnapshot {
 	c.snapshotMu.Lock()
 	triggers := make([]string, 0, len(values))
 	for _, rule := range snapshotRules {
-		if values[rule] >= c.thresholds[rule] && !c.snapshotActive[rule] {
+		if threshold, ok := c.thresholds[rule]; ok && values[rule] >= threshold && !c.snapshotActive[rule] {
 			triggers = append(triggers, rule)
 		}
 	}
@@ -541,7 +552,17 @@ const (
 // condition starts rather than at a fixed level. Older Cloud versions send no
 // header and the configured default remains. Invalid entries are ignored.
 func (c *Client) applyCaptureThresholds(header string) {
-	if !c.snapshots || header == "" || len(header) > 128 {
+	if !c.snapshots {
+		return
+	}
+	if header == "" && c.followCloud {
+		// The workspace setting is off, or Cloud could not confirm it.
+		c.snapshotMu.Lock()
+		clear(c.thresholds)
+		c.snapshotMu.Unlock()
+		return
+	}
+	if header == "" || len(header) > 128 {
 		return
 	}
 	updates := map[string]float64{}
@@ -567,11 +588,15 @@ func (c *Client) commitSnapshotState(m metrics.Metrics) {
 	}
 	values := snapshotValues(m)
 	c.snapshotMu.Lock()
-	c.snapshotActive["cpu"] = values["cpu"] >= c.thresholds["cpu"]
-	c.snapshotActive["memory"] = values["memory"] >= c.thresholds["memory"]
+	above := func(rule string) bool {
+		threshold, ok := c.thresholds[rule]
+		return ok && values[rule] >= threshold
+	}
+	c.snapshotActive["cpu"] = above("cpu")
+	c.snapshotActive["memory"] = above("memory")
 	// A missing disk must not rearm an incident capture as if pressure cleared.
-	if m.DiskCollectionStatus == metrics.DiskCollectionComplete || m.DiskCollectionStatus == "" || values["disk"] >= c.thresholds["disk"] {
-		c.snapshotActive["disk"] = values["disk"] >= c.thresholds["disk"]
+	if m.DiskCollectionStatus == metrics.DiskCollectionComplete || m.DiskCollectionStatus == "" || above("disk") {
+		c.snapshotActive["disk"] = above("disk")
 	}
 	c.snapshotMu.Unlock()
 }

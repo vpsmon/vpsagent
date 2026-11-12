@@ -19,6 +19,19 @@ import (
 	"github.com/vpsmon/vpsmonlib/metrics"
 )
 
+// snapshotSetting reads VPSAGENT_INCIDENT_SNAPSHOTS. Unrecognized values
+// disable captures rather than guess.
+func snapshotSetting(value string) (enabled, followCloud bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return false, true
+	case "1", "true", "yes", "on":
+		return true, false
+	default:
+		return false, false
+	}
+}
+
 func envBool(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
 	case "1", "true", "yes", "on":
@@ -97,11 +110,14 @@ normal:
 		}
 		cloudURL, cloudToken = credentials.URL, credentials.Token
 	}
-	snapshots := envBool("VPSAGENT_INCIDENT_SNAPSHOTS")
+	// Unset follows the Cloud workspace setting; true or false on the server
+	// takes precedence.
+	snapshots, followCloud := snapshotSetting(os.Getenv("VPSAGENT_INCIDENT_SNAPSHOTS"))
 	client, err := cloud.New(cloud.Config{
 		URL: cloudURL, Token: cloudToken,
-		AllowInsecure:   envBool("VPSAGENT_ALLOW_INSECURE"),
-		EnableSnapshots: snapshots,
+		AllowInsecure:       envBool("VPSAGENT_ALLOW_INSECURE"),
+		EnableSnapshots:     snapshots,
+		FollowCloudCaptures: followCloud,
 	})
 	if err != nil {
 		log.Fatalf("invalid Cloud configuration: %v", err)

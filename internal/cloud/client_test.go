@@ -429,3 +429,56 @@ func TestCaptureSupportIsNotAnnouncedWithoutSnapshots(t *testing.T) {
 		t.Fatalf("capture header = %q without opt-in", header)
 	}
 }
+
+func TestFollowCloudCapturesOnlyWhileWorkspaceSettingIsOn(t *testing.T) {
+	var modes []string
+	thresholds := ""
+	var snapshots []bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		_, has := payload["incident_snapshot"]
+		snapshots = append(snapshots, has)
+		modes = append(modes, r.Header.Get(captureSupportHeader))
+		if thresholds != "" {
+			w.Header().Set(captureThresholdsHeader, thresholds)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := New(Config{URL: server.URL, Token: "agent-token", FollowCloudCaptures: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.httpClient = server.Client()
+	client.collectLive = func() ([]metrics.TopProcess, []metrics.TopProcess) {
+		return []metrics.TopProcess{{Name: "worker", CPU: 80}}, nil
+	}
+	send := func(cpu float64) {
+		t.Helper()
+		if err := client.Send(context.Background(), metrics.Metrics{Timestamp: time.Now(), CPUUsage: cpu}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(99) // Setting off: no default threshold in follow mode.
+	thresholds = "cpu=70;memory=80;disk=90"
+	send(99) // This response turns captures on; this sample was judged while off.
+	send(99) // Already above the new threshold: first sample under it captures.
+	send(99) // Same crossing: no repeat.
+	thresholds = ""
+	send(10) // Setting turned off: thresholds cleared.
+	send(99)
+	want := []bool{false, false, true, false, false, false}
+	for i, w := range want {
+		if snapshots[i] != w {
+			t.Fatalf("snapshots = %v, want %v", snapshots, want)
+		}
+	}
+	for _, mode := range modes {
+		if mode != "auto" {
+			t.Fatalf("capture modes = %v", modes)
+		}
+	}
+}
