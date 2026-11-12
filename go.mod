@@ -1,6 +1,6 @@
 module github.com/vpsmon/vpsagent
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/sigstore/sigstore-go v1.3.0
